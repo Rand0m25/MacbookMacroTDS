@@ -1,0 +1,248 @@
+{
+  "schema_version": 1,
+  "header": {
+    "name": "PW2 Fallen Solo (example)",
+    "game": "Tower Defense Simulator",
+    "map": "Polluted Wastelands II",
+    "difficulty": "Fallen",
+    "mode": "solo",
+    "created": "2026-06-23T00:00:00Z",
+    "created_by": "example",
+    "window_aspect": 1.777778,
+    "reference_resolution": {
+      "w": 3200,
+      "h": 1800
+    },
+    "retina_scale_captured_at": 2.0,
+    "notes": "Synthetic example. Re-record frames + coords on your Mac before real use."
+  },
+  "config_overrides": {
+    "loop_count": 0,
+    "sync_default_threshold": 0.88,
+    "relaunch_url": "roblox://placeId=3260590327"
+  },
+  "events": [
+    {
+      "id": 1,
+      "t_ms": 0,
+      "type": "wait",
+      "duration_ms": 1500,
+      "reason": "round 1 intro"
+    },
+    {
+      "id": 2,
+      "t_ms": 1500,
+      "type": "place_tower",
+      "tower": "Farm",
+      "hotbar_slot": 1,
+      "pos": {
+        "x": 0.41,
+        "y": 0.63
+      },
+      "settle_ms": 250,
+      "confirm_click": true
+    },
+    {
+      "id": 3,
+      "t_ms": 2900,
+      "type": "upgrade",
+      "target_pos": {
+        "x": 0.41,
+        "y": 0.63
+      },
+      "upgrade_button_pos": {
+        "x": 0.9,
+        "y": 0.76
+      },
+      "times": 2,
+      "between_ms": 300
+    },
+    {
+      "id": 4,
+      "t_ms": 6000,
+      "type": "sync_point",
+      "comment": "wait for wave 5; stretches under lag",
+      "label": "wave5",
+      "ref_frame": "frames/wave5.png",
+      "region": {
+        "x": 0.43,
+        "y": 0.0,
+        "w": 0.14,
+        "h": 0.07
+      },
+      "on_timeout": "recover",
+      "threshold": 0.85,
+      "timeout_ms": 30000
+    },
+    {
+      "id": 5,
+      "t_ms": 6500,
+      "type": "place_tower",
+      "tower": "Minigunner",
+      "hotbar_slot": 2,
+      "pos": {
+        "x": 0.55,
+        "y": 0.5
+      },
+      "settle_ms": 250,
+      "confirm_click": true
+    },
+    {
+      "id": 6,
+      "t_ms": 8000,
+      "type": "ability",
+      "comment": "farm/commander ability",
+      "tower_pos": {
+        "x": 0.41,
+        "y": 0.63
+      },
+      "ability_button_pos": {
+        "x": 0.9,
+        "y": 0.84
+      },
+      "confirm": false
+    }
+  ],
+  "join_sequence": [
+    {
+      "id": 1,
+      "t_ms": 0,
+      "type": "click",
+      "comment": "lobby Play",
+      "button": "left",
+      "pos": {
+        "x": 0.5,
+        "y": 0.85
+      },
+      "clicks": 1
+    },
+    {
+      "id": 2,
+      "t_ms": 1500,
+      "type": "wait",
+      "duration_ms": 1500,
+      "reason": "matchmaking"
+    },
+    {
+      "id": 3,
+      "t_ms": 1500,
+      "type": "click",
+      "comment": "select map tile",
+      "button": "left",
+      "pos": {
+        "x": 0.5,
+        "y": 0.55
+      },
+      "clicks": 1
+    },
+    {
+      "id": 4,
+      "t_ms": 2200,
+      "type": "click",
+      "comment": "ready/vote",
+      "button": "left",
+      "pos": {
+        "x": 0.85,
+        "y": 0.9
+      },
+      "clicks": 1
+    }
+  ],
+  "leave_reset_sequence": [
+    {
+      "id": 1,
+      "t_ms": 0,
+      "type": "key_press",
+      "key": "esc"
+    },
+    {
+      "id": 2,
+      "t_ms": 300,
+      "type": "wait",
+      "duration_ms": 300
+    },
+    {
+      "id": 3,
+      "t_ms": 300,
+      "type": "click",
+      "comment": "Leave button",
+      "button": "left",
+      "pos": {
+        "x": 0.5,
+        "y": 0.62
+      },
+      "clicks": 1
+    }
+  ],
+  "run_end": {
+    "timeout_ms": 900000,
+    "victory": {
+      "ref_frame": "frames/victory.png",
+      "region": {
+        "x": 0.35,
+        "y": 0.2,
+        "w": 0.3,
+        "h": 0.2
+      },
+      "threshold": 0.85,
+      "action": "leave_and_restart"
+    },
+    "defeat": {
+      "ref_frame": "frames/defeat.png",
+      "region": {
+        "x": 0.35,
+        "y": 0.2,
+        "w": 0.3,
+        "h": 0.2
+      },
+      "threshold": 0.85,
+      "action": "leave_and_restart"
+    }
+  },
+  "expected_map_check": {
+    "ref_frame": "frames/map_selected.png",
+    "region": {
+      "x": 0.3,
+      "y": 0.05,
+      "w": 0.4,
+      "h": 0.1
+    },
+    "threshold": 0.85,
+    "action": "leave_and_restart"
+  },
+  "recovery": {
+    "wrong_map": {
+      "ref_frame": "frames/wrong_map.png",
+      "region": {
+        "x": 0.3,
+        "y": 0.05,
+        "w": 0.4,
+        "h": 0.1
+      },
+      "threshold": 0.85,
+      "action": "leave_and_restart"
+    },
+    "disconnect": {
+      "ref_frame": "frames/disconnect.png",
+      "region": {
+        "x": 0.33,
+        "y": 0.38,
+        "w": 0.34,
+        "h": 0.24
+      },
+      "threshold": 0.9,
+      "action": "reconnect_and_rejoin"
+    },
+    "lobby_anchor": {
+      "ref_frame": "frames/lobby.png",
+      "region": {
+        "x": 0.0,
+        "y": 0.0,
+        "w": 0.3,
+        "h": 0.1
+      },
+      "threshold": 0.85,
+      "action": "leave_and_restart"
+    }
+  }
+}

@@ -1,0 +1,3 @@
+# Dev/test dependencies (enough to run the full test suite on Linux)
+numpy>=2.0
+pytest>=8.0

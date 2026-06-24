@@ -1,0 +1,8 @@
+# Runtime dependencies (install on the MacBook where TDS runs)
+pynput>=1.7            # mouse/keyboard control + recording
+mss>=9.0               # fast screen capture
+numpy>=2.0             # frame comparison for visual-sync
+pyobjc-framework-Quartz>=10.0          # Roblox window bounds (macOS)
+pyobjc-framework-ApplicationServices>=10.0  # Accessibility check (macOS)
+Pillow>=10.0           # load/save reference PNGs
+# opencv-python>=4.9   # optional: faster/extra comparison methods (not required)

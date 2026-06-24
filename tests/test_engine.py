@@ -1,0 +1,114 @@
+"""Engine: timeline order, monotonic clock stretch (M1), panic (M9/M10), loops, dry-run."""
+
+from tds_macro.clock import FakeClock
+from tds_macro.capture import MockCaptureBackend
+from tds_macro.input_backend import MockInputBackend
+from tds_macro.hotkeys import HotkeyManager, HotkeyEvents
+from tds_macro.recovery import MockRecoveryController, Outcome, FailureMode
+from tds_macro import strat as S
+from tds_macro.geometry import Point
+
+from helpers import build_player, mock_config, mk_sync
+
+
+class TimedInput(MockInputBackend):
+    def __init__(self, clock):
+        super().__init__()
+        self.clock = clock
+        self.key_times = {}
+
+    def press_key(self, key, modifiers=()):
+        super().press_key(key, modifiers)
+        self.key_times[key] = self.clock.now_ms()
+
+
+def _keys(*specs):
+    return [S.KeyPressEvent(i + 1, t, "key_press", key=k) for i, (t, k) in enumerate(specs)]
+
+
+def test_timeline_dispatch_order():
+    st = S.StratFile(events=_keys((0, "a"), (100, "b"), (200, "c")), base_dir=".")
+    p, inp, _, _ = build_player(st, cfg=mock_config(loop_count=1))
+    p.run()
+    order = [e["key"] for e in inp.events if e["action"] == "key_press"]
+    assert order == ["a", "b", "c"]
+
+
+def test_monotonic_clock_stretch_preserves_spacing():  # M1
+    events = [S.KeyPressEvent(1, 0, "key_press", key="a"),
+              mk_sync(2, 1000, "s1", stability_frames=1),
+              S.KeyPressEvent(3, 1100, "key_press", key="b"),
+              mk_sync(4, 2000, "s2", stability_frames=1),
+              S.KeyPressEvent(5, 2100, "key_press", key="c")]
+    st = S.StratFile(events=events, base_dir=".")
+    cap = MockCaptureBackend(current_label="lobby")
+
+    def on_sleep(now):
+        cap.current_label = "lobby" if now < 4000 else ("s1" if now < 4600 else "s2")
+
+    clk = FakeClock(on_sleep=on_sleep)
+    inp = TimedInput(clk)
+    p, _, _, _ = build_player(st, cfg=mock_config(loop_count=1), capture=cap, clock=clk, input_backend=inp)
+    p.run()
+    assert p.clock_offset >= 3000                      # stretched by the s1 lag
+    assert inp.key_times["c"] - inp.key_times["b"] >= 999  # spacing preserved, not collapsed
+
+
+def test_panic_halts_and_releases(monkeypatch):  # M9/M10/R22
+    st = S.StratFile(events=[S.KeyPressEvent(1, 0, "key_press", key="a"),
+                             mk_sync(2, 1000, "never")], base_dir=".")
+    hk = HotkeyManager(mock_config(), HotkeyEvents())
+    cap = MockCaptureBackend(current_label="nope")
+    clk = FakeClock(on_sleep=lambda now: hk.events.panic.set() if now >= 2000 else None)
+    p, inp, _, _ = build_player(st, cfg=mock_config(loop_count=1), capture=cap, clock=clk, hotkeys=hk)
+    stats = p.run()
+    assert stats.stopped_reason == "panic"
+    assert not inp.held_keys  # release_all cleared the held "a"
+
+
+def test_dry_run_injects_nothing():
+    st = S.StratFile(events=[S.ClickEvent(1, 0, "click", pos=Point(0.5, 0.5)),
+                             S.KeyPressEvent(2, 50, "key_press", key="x")], base_dir=".")
+    p, inp, _, _ = build_player(st, cfg=mock_config(loop_count=1, dry_run=True))
+    p.run()
+    assert inp.events == []
+
+
+def test_loop_count_runs_n_times():
+    st = S.StratFile(events=_keys((0, "a")), base_dir=".")
+    p, _, _, _ = build_player(st, cfg=mock_config(loop_count=3))
+    stats = p.run()
+    assert stats.runs == 3
+
+
+def test_run_end_records_win():
+    st = S.StratFile(
+        events=_keys((0, "a")),
+        run_end=S.RunEnd(victory=S.DetectorSpec("victory.png", S.Rect(0, 0, 1, 1), 0.9), timeout_ms=5000),
+        base_dir=".")
+    cap = MockCaptureBackend(current_label="victory")  # MockComparator matches det label "victory"
+    p, _, _, _ = build_player(st, cfg=mock_config(loop_count=1), capture=cap)
+    stats = p.run()
+    assert stats.wins == 1
+
+
+def test_expect_sync_timeout_classifies_out_of_cash():  # S12 / engine routing
+    sp = mk_sync(1, 100, "expect_5", timeout=300, on_timeout="recover")
+    st = S.StratFile(events=[sp], base_dir=".")
+    rec = MockRecoveryController(handle_fn=lambda r, sc: Outcome.STOP)
+    p, _, _, _ = build_player(st, cfg=mock_config(loop_count=1),
+                              capture=MockCaptureBackend(current_label="nope"), recovery=rec)
+    p.run()
+    assert FailureMode.OUT_OF_CASH in rec.handle_calls
+
+
+def test_sync_timeout_recover_restart_loop():
+    st = S.StratFile(events=[mk_sync(1, 100, "never", timeout=500, on_timeout="recover")], base_dir=".")
+    cap = MockCaptureBackend(current_label="nope")
+    rec = MockRecoveryController(handle_fn=lambda r, sc: Outcome.REJOIN)
+    # always-REJOIN recovery never completes a run; bounded by max_consecutive_restarts
+    p, _, _, _ = build_player(st, cfg=mock_config(loop_count=1, max_consecutive_restarts=4),
+                              capture=cap, recovery=rec)
+    stats = p.run()
+    assert stats.sync_timeouts >= 1 and rec.handle_calls
+    assert stats.restarts == 4 and stats.runs == 0  # restart != completed run (R6)

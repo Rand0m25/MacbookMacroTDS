@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tds_macro"
+version = "0.1.0"
+description = "Resolution-independent, visually self-correcting macro for Roblox Tower Defense Simulator"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "pynput>=1.7",
+    "mss>=9.0",
+    "numpy>=2.0",
+    "pyobjc-framework-Quartz>=10.0; sys_platform == 'darwin'",
+    "pyobjc-framework-ApplicationServices>=10.0; sys_platform == 'darwin'",
+    "Pillow>=10.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "numpy>=2.0"]
+cv = ["opencv-python>=4.9"]
+
+[project.scripts]
+tds-macro = "tds_macro.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["tds_macro*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,352 @@
+"""Mouse/keyboard control + recording listeners behind one interface.
+
+The real backend uses ``pynput`` (lazy import). Critical safety properties from
+the plan:
+  * release_all() is idempotent and lock-guarded; it snapshots held inputs under
+    a lock then releases them outside it (S14), and is the thing the engine's
+    ``finally`` calls on panic so no key/button is ever left stuck (M9/R22).
+  * move()/drag() take ``should_abort`` and check it between every interpolation
+    step, raising PanicAbort so a panic interrupts within one step (M10).
+  * keys use a documented string codec with a round-trip (S9).
+All coordinates passed here are ABSOLUTE LOGICAL POINTS (the engine converts
+normalized -> logical via geometry just before calling).
+"""
+
+from __future__ import annotations
+
+import threading
+import time
+from typing import Callable, Optional, Protocol
+
+from .errors import PanicAbort
+
+# --- key string codec (S9) ----------------------------------------------------
+# Stable lowercase names <-> pynput Key members. Single characters map to chars.
+_SPECIAL_NAMES = (
+    "esc enter space tab backspace delete up down left right home end page_up "
+    "page_down shift shift_r ctrl ctrl_r alt alt_r cmd cmd_r caps_lock "
+    "f1 f2 f3 f4 f5 f6 f7 f8 f9 f10 f11 f12"
+).split()
+
+
+def key_to_pynput(name: str):
+    from pynput.keyboard import Key, KeyCode  # type: ignore
+
+    if name in _SPECIAL_NAMES:
+        return getattr(Key, name)
+    if name.startswith("vk:"):  # lossless round-trip of vk-only keys
+        try:
+            return KeyCode.from_vk(int(name[3:]))
+        except (ValueError, AttributeError):
+            pass
+    if len(name) == 1:
+        return name
+    # tolerate names like "Key.space"
+    short = name.replace("Key.", "")
+    if hasattr(Key, short):
+        return getattr(Key, short)
+    return KeyCode.from_char(name[0]) if name else KeyCode.from_char(" ")
+
+
+def pynput_to_name(key) -> str:
+    char = getattr(key, "char", None)
+    if char:
+        return char
+    s = str(key)
+    if s.startswith("Key."):
+        return s[len("Key."):]
+    vk = getattr(key, "vk", None)
+    if vk is not None:
+        return f"vk:{vk}"  # encode vk-only keys stably so replay reconstructs them
+    return s
+
+
+def _button_name(button) -> str:
+    return str(button).replace("Button.", "")
+
+
+class InputBackend(Protocol):
+    def move(self, px, py, duration_ms=0, hz=120, clock=None, should_abort=None): ...
+    def click(self, button="left", px=None, py=None, clicks=1, hold_ms=25): ...
+    def drag(self, button, fx, fy, tx, ty, duration_ms=300, hz=120, clock=None, should_abort=None): ...
+    def press_key(self, key, modifiers=()): ...
+    def release_key(self, key, modifiers=()): ...
+    def scroll(self, dx, dy): ...
+    def position(self) -> tuple[float, float]: ...
+    def start_listeners(self, on_move=None, on_click=None, on_scroll=None, on_press=None, on_release=None): ...
+    def stop_listeners(self): ...
+    def release_all(self): ...
+
+
+def _lerp_steps(duration_ms: float, hz: int) -> int:
+    return max(1, int(round(duration_ms / 1000.0 * hz)))
+
+
+class MockInputBackend:
+    """Records every injected action; models held state + abortable drags."""
+
+    def __init__(self) -> None:
+        self.events: list[dict] = []
+        self.held_buttons: set[str] = set()
+        self.held_keys: set[str] = set()
+        self._pos = (0.0, 0.0)
+        self._lock = threading.Lock()
+        # listener callbacks (for recorder tests)
+        self.on_move = self.on_click = self.on_scroll = None
+        self.on_press = self.on_release = None
+
+    def move(self, px, py, duration_ms=0, hz=120, clock=None, should_abort=None):
+        steps = _lerp_steps(duration_ms, hz) if duration_ms > 0 else 1
+        for _ in range(steps):
+            if should_abort and should_abort():
+                raise PanicAbort("panic during move")
+        self._pos = (px, py)
+        self.events.append({"action": "move", "x": px, "y": py, "duration_ms": duration_ms})
+
+    def click(self, button="left", px=None, py=None, clicks=1, hold_ms=25):
+        if px is not None and py is not None:
+            self.move(px, py)
+        self.events.append({"action": "click", "button": button, "x": self._pos[0], "y": self._pos[1], "clicks": clicks, "hold_ms": hold_ms})
+
+    def drag(self, button, fx, fy, tx, ty, duration_ms=300, hz=120, clock=None, should_abort=None):
+        self.move(fx, fy)
+        with self._lock:
+            self.held_buttons.add(button)
+        self.events.append({"action": "press", "button": button, "x": fx, "y": fy})
+        steps = _lerp_steps(duration_ms, hz)
+        for i in range(1, steps + 1):
+            if should_abort and should_abort():
+                raise PanicAbort("panic during drag")  # button intentionally left held
+            t = i / steps
+            self._pos = (fx + (tx - fx) * t, fy + (ty - fy) * t)
+        with self._lock:
+            self.held_buttons.discard(button)
+        self.events.append({"action": "release", "button": button, "x": tx, "y": ty})
+
+    def press_key(self, key, modifiers=()):
+        with self._lock:
+            self.held_keys.add(key)
+        self.events.append({"action": "key_press", "key": key, "modifiers": list(modifiers)})
+
+    def release_key(self, key, modifiers=()):
+        with self._lock:
+            self.held_keys.discard(key)
+        self.events.append({"action": "key_release", "key": key, "modifiers": list(modifiers)})
+
+    def scroll(self, dx, dy):
+        self.events.append({"action": "scroll", "dx": dx, "dy": dy})
+
+    def position(self):
+        return self._pos
+
+    def start_listeners(self, on_move=None, on_click=None, on_scroll=None, on_press=None, on_release=None):
+        self.on_move, self.on_click, self.on_scroll = on_move, on_click, on_scroll
+        self.on_press, self.on_release = on_press, on_release
+
+    def stop_listeners(self):
+        self.on_move = self.on_click = self.on_scroll = self.on_press = self.on_release = None
+
+    def release_all(self):
+        with self._lock:
+            buttons = list(self.held_buttons)
+            keys = list(self.held_keys)
+            self.held_buttons.clear()
+            self.held_keys.clear()
+        for b in buttons:
+            self.events.append({"action": "release", "button": b, "reason": "release_all"})
+        for k in keys:
+            self.events.append({"action": "key_release", "key": k, "reason": "release_all"})
+
+    # --- helpers for recorder tests: simulate raw OS events ---
+    def feed_move(self, x, y):
+        if self.on_move:
+            self.on_move(x, y)
+
+    def feed_click(self, x, y, button="left", pressed=True):
+        if self.on_click:
+            self.on_click(x, y, button, pressed)
+
+    def feed_key(self, key, pressed=True):
+        cb = self.on_press if pressed else self.on_release
+        if cb:
+            cb(key)
+
+    def feed_scroll(self, x, y, dx, dy):
+        if self.on_scroll:
+            self.on_scroll(x, y, dx, dy)
+
+
+class PynputInputBackend:
+    """Real macOS backend via pynput (lazy import)."""
+
+    def __init__(self) -> None:
+        self._mouse = None
+        self._kb = None
+        self._lock = threading.Lock()
+        self._held_buttons: set[str] = set()
+        self._held_keys: set[str] = set()
+        self._mouse_listener = None
+        self._kb_listener = None
+
+    def _ensure(self):
+        if self._mouse is None:
+            from pynput.mouse import Controller as MouseController  # type: ignore
+            from pynput.keyboard import Controller as KeyController  # type: ignore
+
+            self._mouse = MouseController()
+            self._kb = KeyController()
+
+    def _button(self, name: str):
+        from pynput.mouse import Button  # type: ignore
+
+        return getattr(Button, name)
+
+    def move(self, px, py, duration_ms=0, hz=120, clock=None, should_abort=None):
+        self._ensure()
+        if duration_ms <= 0:
+            self._mouse.position = (px, py)
+            return
+        sx, sy = self._mouse.position
+        steps = _lerp_steps(duration_ms, hz)
+        for i in range(1, steps + 1):
+            if should_abort and should_abort():
+                raise PanicAbort("panic during move")
+            t = i / steps
+            self._mouse.position = (sx + (px - sx) * t, sy + (py - sy) * t)
+            self._sleep(duration_ms / steps, clock)
+
+    @staticmethod
+    def _sleep(ms, clock):
+        if clock is not None:
+            clock.sleep(ms)
+        else:
+            time.sleep(max(0.0, ms) / 1000.0)
+
+    def click(self, button="left", px=None, py=None, clicks=1, hold_ms=25):
+        self._ensure()
+        btn = self._button(button)
+        if px is not None and py is not None:
+            self._mouse.position = (px, py)
+        if clicks >= 2:
+            self._mouse.click(btn, clicks)  # true double-click semantics on macOS
+            return
+        with self._lock:
+            self._held_buttons.add(button)
+        self._mouse.press(btn)
+        time.sleep(max(0.0, hold_ms) / 1000.0)
+        self._mouse.release(btn)
+        with self._lock:
+            self._held_buttons.discard(button)
+
+    def drag(self, button, fx, fy, tx, ty, duration_ms=300, hz=120, clock=None, should_abort=None):
+        self._ensure()
+        btn = self._button(button)
+        self._mouse.position = (fx, fy)
+        with self._lock:
+            self._held_buttons.add(button)
+        self._mouse.press(btn)
+        steps = _lerp_steps(duration_ms, hz)
+        try:
+            for i in range(1, steps + 1):
+                if should_abort and should_abort():
+                    raise PanicAbort("panic during drag")
+                t = i / steps
+                self._mouse.position = (fx + (tx - fx) * t, fy + (ty - fy) * t)
+                self._sleep(duration_ms / steps, clock)
+        finally:
+            self._mouse.release(btn)
+            with self._lock:
+                self._held_buttons.discard(button)
+
+    def press_key(self, key, modifiers=()):
+        self._ensure()
+        # Record each key BEFORE pressing it, so a mid-sequence exception still
+        # leaves what was physically pressed known to release_all (no stuck key).
+        for m in modifiers:
+            with self._lock:
+                self._held_keys.add(m)
+            self._kb.press(key_to_pynput(m))
+        with self._lock:
+            self._held_keys.add(key)
+        self._kb.press(key_to_pynput(key))
+
+    def release_key(self, key, modifiers=()):
+        self._ensure()
+        self._kb.release(key_to_pynput(key))
+        for m in modifiers:
+            self._kb.release(key_to_pynput(m))
+        with self._lock:
+            self._held_keys.discard(key)
+            for m in modifiers:
+                self._held_keys.discard(m)
+
+    def scroll(self, dx, dy):
+        self._ensure()
+        self._mouse.scroll(dx, dy)
+
+    def position(self):
+        self._ensure()
+        return self._mouse.position
+
+    def start_listeners(self, on_move=None, on_click=None, on_scroll=None, on_press=None, on_release=None):
+        from pynput import mouse, keyboard  # type: ignore
+
+        def _m_move(x, y):
+            if on_move:
+                on_move(x, y)
+
+        def _m_click(x, y, button, pressed):
+            if on_click:
+                on_click(x, y, _button_name(button), pressed)
+
+        def _m_scroll(x, y, dx, dy):
+            if on_scroll:
+                on_scroll(x, y, dx, dy)
+
+        def _k_press(key):
+            if on_press:
+                on_press(pynput_to_name(key))
+
+        def _k_release(key):
+            if on_release:
+                on_release(pynput_to_name(key))
+
+        self._mouse_listener = mouse.Listener(on_move=_m_move, on_click=_m_click, on_scroll=_m_scroll)
+        self._kb_listener = keyboard.Listener(on_press=_k_press, on_release=_k_release)
+        self._mouse_listener.start()
+        self._kb_listener.start()
+
+    def stop_listeners(self):
+        for lst in (self._mouse_listener, self._kb_listener):
+            if lst is not None:
+                try:
+                    lst.stop()
+                except Exception:
+                    pass
+        self._mouse_listener = self._kb_listener = None
+
+    def release_all(self):
+        self._ensure()
+        with self._lock:
+            buttons = list(self._held_buttons)
+            keys = list(self._held_keys)
+            self._held_buttons.clear()
+            self._held_keys.clear()
+        for b in buttons:
+            try:
+                self._mouse.release(self._button(b))
+            except Exception:
+                pass
+        for k in keys:
+            try:
+                self._kb.release(key_to_pynput(k))
+            except Exception:
+                pass
+
+
+def make_input_backend(config) -> InputBackend:
+    from .config import InputBackendKind
+
+    if config.input_backend == InputBackendKind.MOCK:
+        return MockInputBackend()
+    return PynputInputBackend()
