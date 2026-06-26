@@ -50,11 +50,14 @@ def check_screen_recording(capture=None, geo=None) -> bool:
     if not is_macos() or capture is None or geo is None:
         return True
     try:
-        import numpy as np  # type: ignore
 
         frame = capture.grab_window(geo)
         arr = frame.as_numpy().astype("float64")
-        return float(arr.var()) > 1.0  # genuine content has non-trivial variance
+        # macOS denial returns a perfectly flat BLACK frame. A legitimately near-uniform
+        # window (dark scene, loading screen, solid-colour UI panel) still has a nonzero
+        # mean, so only treat flat-AND-black as denied (avoids false negatives).
+        denied = float(arr.var()) < 1e-6 and float(arr.mean()) < 1.0
+        return not denied
     except Exception:
         return False
 

@@ -15,10 +15,13 @@ normalized -> logical via geometry just before calling).
 from __future__ import annotations
 
 import threading
+import logging
 import time
-from typing import Callable, Optional, Protocol
+from typing import Protocol
 
 from .errors import PanicAbort
+
+log = logging.getLogger("tds_macro.input_backend")
 
 # --- key string codec (S9) ----------------------------------------------------
 # Stable lowercase names <-> pynput Key members. Single characters map to chars.
@@ -45,7 +48,10 @@ def key_to_pynput(name: str):
     short = name.replace("Key.", "")
     if hasattr(Key, short):
         return getattr(Key, short)
-    return KeyCode.from_char(name[0]) if name else KeyCode.from_char(" ")
+    # unrecognized (multi-char dead-key/IME grapheme, or empty): skip it rather than inject a
+    # wrong character. Callers below treat None as "no key" (recheck #w-keynone).
+    log.warning("unrecognized key %r; skipping it", name)
+    return None
 
 
 def pynput_to_name(key) -> str:
@@ -227,8 +233,15 @@ class PynputInputBackend:
         btn = self._button(button)
         if px is not None and py is not None:
             self._mouse.position = (px, py)
+        # Track the button as held BEFORE the OS call and discard only AFTER it returns
+        # normally, so a mid-call raise leaves it tracked for release_all() to recover
+        # (releasing an already-up button is harmless) — recheck #w-click.
         if clicks >= 2:
-            self._mouse.click(btn, clicks)  # true double-click semantics on macOS
+            with self._lock:
+                self._held_buttons.add(button)
+            self._mouse.click(btn, clicks)  # true double-click semantics on macOS (press+release internally)
+            with self._lock:
+                self._held_buttons.discard(button)
             return
         with self._lock:
             self._held_buttons.add(button)
@@ -262,19 +275,30 @@ class PynputInputBackend:
         self._ensure()
         # Record each key BEFORE pressing it, so a mid-sequence exception still
         # leaves what was physically pressed known to release_all (no stuck key).
+        # An unmappable key (key_to_pynput -> None) is skipped, not tracked (recheck #w-keynone).
         for m in modifiers:
+            pm = key_to_pynput(m)
+            if pm is None:
+                continue
             with self._lock:
                 self._held_keys.add(m)
-            self._kb.press(key_to_pynput(m))
+            self._kb.press(pm)
+        pk = key_to_pynput(key)
+        if pk is None:
+            return
         with self._lock:
             self._held_keys.add(key)
-        self._kb.press(key_to_pynput(key))
+        self._kb.press(pk)
 
     def release_key(self, key, modifiers=()):
         self._ensure()
-        self._kb.release(key_to_pynput(key))
+        pk = key_to_pynput(key)
+        if pk is not None:
+            self._kb.release(pk)
         for m in modifiers:
-            self._kb.release(key_to_pynput(m))
+            pm = key_to_pynput(m)
+            if pm is not None:
+                self._kb.release(pm)
         with self._lock:
             self._held_keys.discard(key)
             for m in modifiers:
@@ -338,8 +362,11 @@ class PynputInputBackend:
             except Exception:
                 pass
         for k in keys:
+            pk = key_to_pynput(k)
+            if pk is None:
+                continue
             try:
-                self._kb.release(key_to_pynput(k))
+                self._kb.release(pk)
             except Exception:
                 pass
 

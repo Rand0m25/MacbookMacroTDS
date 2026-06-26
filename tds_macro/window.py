@@ -9,11 +9,14 @@ Platform imports are lazy so this module imports cleanly on Linux (M11).
 
 from __future__ import annotations
 
+import logging
 from typing import Protocol
 
 from .config import Config, WindowBackendKind
 from .errors import WindowNotFoundError
 from .geometry import WindowGeometry
+
+log = logging.getLogger("tds_macro.window")
 
 
 class WindowProvider(Protocol):
@@ -83,6 +86,8 @@ class QuartzWindowProvider:
                 continue
             b = w.get("kCGWindowBounds") or {}
             area = float(b.get("Width", 0)) * float(b.get("Height", 0))
+            if area <= 0:  # skip minimized/off-screen zero-size windows (else w=h=0 downstream)
+                continue
             if area > best_area:
                 best_area = area
                 best = w
@@ -143,23 +148,30 @@ class QuartzWindowProvider:
     def activate(self) -> None:
         import subprocess
 
-        for name in self._owner_names:
+        # try every candidate name and only stop on an osascript that actually succeeded
+        # (check=False means a non-zero exit doesn't raise) — recheck #w8.1
+        candidates = list(dict.fromkeys([*self._owner_names, *self.OWNER_NAMES]))
+        for name in candidates:
             try:
-                subprocess.run(
+                proc = subprocess.run(
                     ["osascript", "-e", f'tell application "{name}" to activate'],
-                    check=False,
-                    capture_output=True,
-                    timeout=3,
+                    check=False, capture_output=True, timeout=3,
                 )
-                return
+                if proc.returncode == 0:
+                    return
             except Exception:
                 continue
+        log.warning("could not activate the Roblox window via osascript (tried %s)", candidates)
 
 
 def make_window_provider(config: Config) -> WindowProvider:
     if config.window_backend == WindowBackendKind.MOCK or config.window_rect_override is not None:
+        # On a real Mac (QUARTZ) with a rect override but no explicit retina, mirror the
+        # Quartz 2.0 default so physical-pixel conversions aren't off by 2x (recheck #w8.2);
+        # an explicit MOCK backend stays at 1.0 (internally consistent with mock capture).
+        default_retina = 2.0 if config.window_backend == WindowBackendKind.QUARTZ else 1.0
         return MockWindowProvider(
             rect=config.window_rect_override or (0, 0, 1600, 900),
-            retina=config.retina_scale_override or 1.0,
+            retina=config.retina_scale_override or default_retina,
         )
     return QuartzWindowProvider(config)

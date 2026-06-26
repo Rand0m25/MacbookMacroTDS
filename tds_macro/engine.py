@@ -18,17 +18,17 @@ from __future__ import annotations
 
 import logging
 import random
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from typing import Callable, Optional
 
-from .config import Config, MatchMethod
+from .config import Config
 from .errors import PanicAbort
 from .frame import Frame
 from .geometry import Coordinates, Point, WindowGeometry
 from .recovery import FailureMode, Outcome
 from .strat import (
-    AbilityEvent, ClickEvent, DragEvent, Event, KeyPressEvent, KeyReleaseEvent,
+    ClickEvent, DragEvent, Event, KeyPressEvent, KeyReleaseEvent,
     MouseMoveEvent, ScrollEvent, StratFile, SyncPointEvent, WaitEvent, expand_all,
 )
 
@@ -81,10 +81,16 @@ def _default_ref_loader(path: str) -> Frame:
     return load_reference(path)
 
 
+def _default_launcher(config: Config):
+    from .launcher import make_launcher
+
+    return make_launcher(config)
+
+
 class Player:
     def __init__(self, strat: StratFile, window, input_backend, capture, comparator,
                  clock, recovery, config: Config, hotkeys=None,
-                 ref_loader: Optional[Callable[[str], Frame]] = None) -> None:
+                 ref_loader: Optional[Callable[[str], Frame]] = None, launcher=None) -> None:
         self.strat = strat
         self.window = window
         self.input = input_backend
@@ -95,6 +101,7 @@ class Player:
         self.config = config
         self.hotkeys = hotkeys
         self.ref_loader = ref_loader or _default_ref_loader
+        self.launcher = launcher or _default_launcher(config)
         self.stats = RunStats()
         self.state = RunState.IDLE
 
@@ -126,11 +133,13 @@ class Player:
             return
         if not self.hotkeys.events.pause.is_set():
             return
+        prev = self.state  # restore after resume so observers don't see stale PAUSED (recheck #w-pause)
         start = self.clock.now_ms()
         while self.hotkeys.events.pause.is_set() and not self.hotkeys.should_abort():
             self.state = RunState.PAUSED
             self.clock.sleep(50)
         self._absorb_wall_time(start)  # don't let the pause make later events fire back-to-back
+        self.state = prev
 
     def _elapsed(self) -> float:
         return self.clock.now_ms() - self._iter_t0
@@ -228,9 +237,16 @@ class Player:
             matched = score >= threshold
             if not matched:
                 seen_low = True
+            elif last_live is None:
+                seen_low = True  # already in target state at entry -> no falling edge needed (recheck #w2.2)
             settled = True
-            if require_edge and last_live is not None:
-                settled = self.comparator.score(live, last_live, method) >= _SETTLE_THRESHOLD
+            if require_edge:
+                # require at least one frame-to-frame settle comparison before firing, so
+                # require_settled actually gates even at stability_frames==1 (recheck #w-settle).
+                # Use the SAME mask as the match, else a masked-out dynamic region (timer/anim)
+                # keeps frame-to-frame similarity below threshold forever (recheck #w-settle-mask).
+                settled = (last_live is not None
+                           and self.comparator.score(live, last_live, method, mask) >= _SETTLE_THRESHOLD)
             last_live = live
             log.debug("sync %s score=%.3f thr=%.3f streak=%d", sync.label, score, threshold, streak)
 
@@ -281,6 +297,7 @@ class Player:
         return FailureMode.NONE
 
     def _route_recovery(self, fm: FailureMode) -> None:
+        prev = self.state  # restore the caller's phase on RESUME (LOBBY/WAIT_RUN_END/IN_MATCH) (recheck #w-routestate)
         self.state = RunState.RECOVERY
         self.stats.recoveries += 1
         started = self.clock.now_ms()
@@ -291,9 +308,9 @@ class Player:
         if outcome == Outcome.REJOIN:
             raise _RestartLoop(fm.value)
         # RESUME: absorb the wall time recovery consumed so the rest of the
-        # timeline keeps its spacing, then continue where we were (D7).
+        # timeline keeps its spacing, then continue in the phase we came from (D7).
         self._absorb_wall_time(started)
-        self.state = RunState.IN_MATCH
+        self.state = prev if prev != RunState.RECOVERY else RunState.IN_MATCH
 
     # --- sequence playback ------------------------------------------------
     def _play_sequence(self, events: list[Event], state: RunState) -> None:
@@ -304,6 +321,7 @@ class Player:
         self._iter_t0 = self.clock.now_ms()
         self.clock_offset = 0.0
         prims = expand_all(events)
+        prev_target = None
         for e in prims:
             self._abort_check()
             self._maybe_pause()
@@ -311,7 +329,13 @@ class Player:
             if self.config.jitter_ms:
                 jitter = self._rng.uniform(-self.config.jitter_ms, self.config.jitter_ms)
             target = self._iter_t0 + e.t_ms + self.clock_offset + jitter
+            if prev_target is not None and target < prev_target:
+                # jitter must not pull an event before the previous one: a negative draw could
+                # otherwise make sleep_until return instantly and fire two events back-to-back,
+                # collapsing/inverting their intended spacing (round 21 #1).
+                target = prev_target
             self.clock.sleep_until(target)
+            prev_target = target
             self._maybe_run_guards()
 
             if isinstance(e, SyncPointEvent):
@@ -340,7 +364,9 @@ class Player:
             return
         if action == "abort":
             raise _StopRun(f"sync '{sync.label}' timed out (on_timeout=abort)")
-        # "recover", or "retry" whose retry budget is now exhausted -> classify + recover
+        # "recover" / retry-exhausted: absorb the elapsed timeout (mirror 'continue') so a
+        # RESUME recovery outcome doesn't collapse the remaining timeline's spacing (recheck #6).
+        self._rebase_clock(sync.t_ms)
         if str(sync.label).startswith("expect_"):
             # an action-verify sync that never confirmed: the action didn't take
             fm = FailureMode.OUT_OF_CASH
@@ -359,6 +385,7 @@ class Player:
             return FailureMode.NONE
         self.state = RunState.WAIT_RUN_END
         deadline = self.clock.now_ms() + re.timeout_ms
+        added = 0.0  # cumulative refocus extension, capped so focus-flapping can't hang us
         while self.clock.now_ms() < deadline:
             self._abort_check()
             self._refresh_geo()
@@ -369,11 +396,23 @@ class Player:
                 ref = self._ref(det.ref_frame, mode.value)
                 if self.comparator.score(window, ref, self.config.sync_match_method, det.mask or None) >= det.threshold:
                     return mode
-            # also catch disconnect/kick while waiting for the end
+            # also catch focus-loss / disconnect / kick while waiting for the end
             fm = self._detect_failure()
-            if fm in (FailureMode.DISCONNECTED, FailureMode.WRONG_MAP):
+            if fm == FailureMode.FOCUS_LOST:
+                # _detect_failure returns FOCUS_LOST first, which would otherwise mask
+                # disconnect/wrong-map; re-acquire focus then keep waiting (recheck #w1).
+                t0 = self.clock.now_ms()
+                self._route_recovery(fm)  # RESUME on refocus, else raises _StopRun
+                # extend by the refocus time so it doesn't eat the run-end window (recheck #w11),
+                # but cap the TOTAL extension at one timeout_ms so persistent focus-flapping
+                # can't grow the deadline without bound and hang the loop (recheck #w-flap)
+                delta = self.clock.now_ms() - t0
+                if added < re.timeout_ms:
+                    deadline += min(delta, re.timeout_ms - added)
+                    added += delta
+            elif fm in (FailureMode.DISCONNECTED, FailureMode.WRONG_MAP):
                 return fm
-            self.clock.sleep(self.config.recovery_check_every_ms)
+            self.clock.sleep(max(1, self.config.recovery_check_every_ms))  # never 0 -> no hang/busy-spin
         return FailureMode.NONE
 
     # --- top-level run loop ----------------------------------------------
@@ -402,6 +441,58 @@ class Player:
             log.warning("expected-map check failed (score=%.3f < %.3f) -> recovery WRONG_MAP", score, det.threshold)
             self._route_recovery(FailureMode.WRONG_MAP)
 
+    # --- join (private-server link or recorded lobby clicks) -------------
+    def _private_server_url(self) -> str:
+        return (self.config.private_server_url or self.strat.header.private_server_url or "").strip()
+
+    def _await_join(self) -> bool:
+        """After opening the private-server link, wait (up to join_timeout_ms) for Roblox
+        to be frontmost and — if an expected_map_check is configured — the map to appear.
+        Returns False on timeout. Works for both auto-launch and (browser auto-open) flows."""
+        det = self.strat.expected_map_check
+        deadline = self.clock.now_ms() + self.config.join_timeout_ms
+        added = 0.0  # cap pause-extension so pause-flapping can't hang the join (mirrors _wait_run_end)
+        while self.clock.now_ms() < deadline:
+            self._abort_check()
+            t0 = self.clock.now_ms()
+            self._maybe_pause()
+            # a pause longer than join_timeout_ms must not eat the join window and trigger a
+            # spurious WRONG_MAP on resume; extend the deadline by the paused time (round 19 #1).
+            delta = self.clock.now_ms() - t0
+            if delta and added < self.config.join_timeout_ms:
+                deadline += min(delta, self.config.join_timeout_ms - added)
+                added += delta
+            try:
+                self.window.activate()  # nudge Roblox to the foreground (the browser may have it)
+            except Exception:
+                pass
+            if self.window.is_frontmost():
+                if det is None:
+                    return True  # nothing to confirm against -> focused == joined
+                self._refresh_geo()
+                frame = self.capture.grab_window(self._geo)
+                ref = self._ref(det.ref_frame, "expected_map")
+                if self.comparator.score(frame, ref, self.config.sync_match_method,
+                                         det.mask or None) >= det.threshold:
+                    return True
+            self.clock.sleep(max(1, self.config.recovery_check_every_ms))
+        log.warning("join: timed out (%dms) waiting for the private server to load", self.config.join_timeout_ms)
+        return False
+
+    def _join(self) -> None:
+        """One join path used at loop start AND on every recovery rejoin (design #4):
+        if a private-server link is set, open it and wait for the server to load; then
+        play join_sequence (full lobby nav when there's no link, or post-load clicks when
+        there is). A link that never loads routes to bounded WRONG_MAP recovery."""
+        url = self._private_server_url()
+        if url and not self.config.dry_run:  # dry-run preview must not open links or stall (recheck #w-dry)
+            log.info("join: opening private server link")
+            self.launcher.open_url(url)
+            if not self._await_join():
+                self._route_recovery(FailureMode.WRONG_MAP)  # bounded by max_consecutive_restarts
+        if self.strat.join_sequence:
+            self._play_sequence(self.strat.join_sequence, RunState.LOBBY)
+
     def run(self) -> RunStats:
         try:
             self._arm()
@@ -410,13 +501,13 @@ class Player:
             while True:
                 self._abort_check()  # panic/stop always interrupts the loop (D-r3)
                 iter_start = self.clock.now_ms()
+                completed = False
                 try:
                     self._iter_t0 = self.clock.now_ms()
                     self.clock_offset = 0.0
                     self._last_guard_ms = -1e18
 
-                    if self.strat.join_sequence:
-                        self._play_sequence(self.strat.join_sequence, RunState.LOBBY)
+                    self._join()  # private-server link and/or recorded lobby clicks
                     self._verify_expected_map()
                     self._play_sequence(self.strat.events, RunState.IN_MATCH)
 
@@ -428,9 +519,20 @@ class Player:
                         self.stats.losses += 1
                     elif end in (FailureMode.DISCONNECTED, FailureMode.WRONG_MAP):
                         self._route_recovery(end)  # may raise _RestartLoop/_StopRun
+                    elif end == FailureMode.NONE and self.strat.run_end is not None:
+                        # run_end was configured but neither victory/defeat/disconnect/
+                        # wrong-map confirmed before timeout_ms -> the match is stuck, not
+                        # finished. Route to recovery (leave/reset/rejoin) instead of
+                        # silently counting a phantom run that would satisfy loop_count and
+                        # reset the restart budget, violating the line-61 invariant
+                        # "runs = matches actually completed (reached run-end)" (round 17 #2).
+                        # STUCK_SYNC -> REJOIN raises _RestartLoop (bounded by
+                        # max_consecutive_restarts); over-budget -> _StopRun.
+                        self._route_recovery(FailureMode.STUCK_SYNC)
 
                     self.stats.runs += 1
                     consecutive_restarts = 0  # a run actually completed
+                    completed = True
                 except _RestartLoop as r:
                     log.info("restarting loop after: %s", r)
                     self.stats.restarts += 1  # NOT a completed run (R6: don't satisfy loop_count)
@@ -448,7 +550,8 @@ class Player:
                 if loop_count and self.stats.runs >= loop_count:
                     self.stats.stopped_reason = "loop_count reached"
                     break
-                self._maybe_break_between_runs()
+                if completed:  # only break between COMPLETED runs, not restart attempts (recheck #w-break)
+                    self._maybe_break_between_runs()
                 # never busy-spin a zero-work iteration (e.g. empty events + no
                 # run_end); the floor sleep is panic-aware on RealClock (D-r3).
                 idle = self.config.min_inter_event_ms - (self.clock.now_ms() - iter_start)
@@ -477,6 +580,7 @@ class Player:
 
     def _maybe_break_between_runs(self) -> None:
         cfg = self.config
-        if cfg.break_every_runs and cfg.break_seconds and self.stats.runs % cfg.break_every_runs == 0:
+        if (cfg.break_every_runs and cfg.break_seconds and self.stats.runs > 0
+                and self.stats.runs % cfg.break_every_runs == 0):
             log.info("taking a %ss break after %d runs (humanization)", cfg.break_seconds, self.stats.runs)
             self.clock.sleep(cfg.break_seconds * 1000)

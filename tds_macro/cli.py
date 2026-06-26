@@ -42,6 +42,8 @@ def _build_config(args, overrides: dict | None = None) -> Config:
         val = getattr(args, key, None)
         if val is not None:
             setattr(config, key, val)
+    if getattr(args, "private_server", None):
+        config.private_server_url = args.private_server
     if getattr(args, "window_rect", None):
         config.window_rect_override = tuple(args.window_rect)
     if getattr(args, "mock", False) or sys.platform != "darwin":
@@ -157,6 +159,8 @@ def cmd_validate(args) -> int:
         ui.kv("map", st.header.map or "?"), ui.kv("difficulty", st.header.difficulty or "?"),
         ui.kv("events", len(st.events)), ui.kv("join", len(st.join_sequence)),
         ui.kv("leave_reset", len(st.leave_reset_sequence)),
+        ui.kv("private_server", bool(st.header.private_server_url),
+              good=bool(st.header.private_server_url)),
     ]))
     print("  " + "  ".join([
         ui.kv("run_end", bool(st.run_end), good=bool(st.run_end)),
@@ -192,15 +196,16 @@ def cmd_record(args) -> int:
     config = _build_config(args)
     config.frames_dir = args.frames_dir or "frames"
     window, input_backend, capture, _cmp = _build_backends(config)
-    hk = HotkeyManager(config)
-    hk.start()
-    clock = RealClock(should_abort=hk.should_abort)
-    rec = Recorder(window, input_backend, capture, config, hk, clock=clock)
     header = Header(name=args.name or "", map=args.map or "", difficulty=args.difficulty or "",
                     created=datetime.now(timezone.utc).isoformat(), created_by=os.environ.get("USER", ""))
-    ui.info(f"Recording... play TDS now. Press {config.panic_hotkey} to stop, "
-            f"{config.mark_sync_hotkey} to drop a sync point.")
+    hk = HotkeyManager(config)
+    strat = None
     try:
+        hk.start()  # inside the try so its finally always stops the listener (recheck #w-rec)
+        clock = RealClock(should_abort=hk.should_abort)
+        rec = Recorder(window, input_backend, capture, config, hk, clock=clock)
+        ui.info(f"Recording... play TDS now. Press {config.panic_hotkey} to stop, "
+                f"{config.mark_sync_hotkey} to drop a sync point.")
         strat = rec.run(args.strat, header=header)
     except Exception as e:  # e.g. Roblox window not found at record start
         ui.err(f"recording failed: {e}")
@@ -233,10 +238,10 @@ def cmd_play(args) -> int:
 
     try:
         config = _build_config(args, overrides=st.config_overrides)
+        cfg_problems = config.validate()  # inside the try so any None-leak fails cleanly too
     except (ValueError, TypeError) as e:
         ui.err(f"bad config_overrides in {args.strat}: {e}")
         return 1
-    cfg_problems = config.validate()  # wire the (previously dead) range checks (R6)
     if cfg_problems:
         ui.err("invalid config:")
         for p in cfg_problems:
@@ -294,7 +299,11 @@ def cmd_calibrate(args) -> int:
     from .visual import load_reference
 
     print(ui.banner(f"calibrate {os.path.basename(args.strat)}"))
-    geo = window.get_geometry()
+    try:
+        geo = window.get_geometry()
+    except Exception as e:
+        ui.err(f"could not locate the Roblox window: {e}")
+        return 1
     aspect_ok = abs(geo.aspect - st.header.window_aspect) <= config.aspect_warn_tolerance if st.header.window_aspect else None
     print("  " + "  ".join([
         ui.kv("window", f"{geo.w}x{geo.h}"), ui.kv("retina", geo.retina),
@@ -305,10 +314,14 @@ def cmd_calibrate(args) -> int:
     for e in st.events:
         if isinstance(e, SyncPointEvent):
             any_sync = True
-            live = capture.grab_region(geo, e.region)
-            ref = load_reference(st.resolve_frame(e.ref_frame))
-            ref.label = e.label
-            score = comparator.score(live, ref, e.match or config.sync_match_method, e.mask or None)
+            try:
+                live = capture.grab_region(geo, e.region)
+                ref = load_reference(st.resolve_frame(e.ref_frame))
+                ref.label = e.label
+                score = comparator.score(live, ref, e.match or config.sync_match_method, e.mask or None)
+            except Exception as ex:  # missing/unreadable frame -> report, keep scoring the rest
+                ui.err(f"sync {e.label!r}: could not score ({type(ex).__name__}: {ex})")
+                continue
             thr = e.threshold if e.threshold is not None else config.sync_default_threshold
             if score >= thr:
                 ui.ok(f"sync {e.label!r}: " + ui.kv("score", f"{score:.3f}", good=True) + "  " + ui.kv("threshold", f"{thr:.3f}"))
@@ -344,6 +357,12 @@ def cmd_smoke(args) -> int:
     return 0
 
 
+def cmd_gui(args) -> int:
+    from .gui import run_gui
+
+    return run_gui(_build_config(args))
+
+
 # --------------------------------------------------------------------------- #
 def _add_common(p):
     p.add_argument("--mock", action="store_true", help="force mock backends (no real input/capture)")
@@ -360,6 +379,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     pr = sub.add_parser("record", help="record your play into a strat file")
     pr.add_argument("strat"); pr.add_argument("--name"); pr.add_argument("--map"); pr.add_argument("--difficulty")
+    pr.add_argument("--private-server", default=None,
+                    help="private-server link to bake into the strat (always rejoins this server)")
     _add_common(pr); pr.set_defaults(func=cmd_record)
 
     pp = sub.add_parser("play", help="replay a strat with visual-sync + auto-loop")
@@ -367,6 +388,8 @@ def build_parser() -> argparse.ArgumentParser:
     pp.add_argument("--loop-count", type=int, default=None)
     pp.add_argument("--dry-run", action="store_true", default=None)
     pp.add_argument("--accept-ban-risk", action="store_true")
+    pp.add_argument("--private-server", default=None,
+                    help="override the strat's private-server link for this run")
     _add_common(pp); pp.set_defaults(func=cmd_play)
 
     pv = sub.add_parser("validate", help="validate a strat file")
@@ -380,6 +403,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     ps = sub.add_parser("smoke", help="quick on-Mac sanity check")
     _add_common(ps); ps.set_defaults(func=cmd_smoke)
+
+    pgui = sub.add_parser("gui", help="launch the control-panel GUI")
+    _add_common(pgui); pgui.set_defaults(func=cmd_gui)
     return parser
 
 

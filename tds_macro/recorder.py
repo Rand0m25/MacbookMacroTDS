@@ -12,6 +12,7 @@ Two pieces:
 
 from __future__ import annotations
 
+import logging
 import math
 import os
 import threading
@@ -22,8 +23,10 @@ from .config import Config
 from .geometry import Coordinates, Point, Rect, clamp01
 from .strat import (
     ClickEvent, DragEvent, Event, Header, KeyPressEvent, KeyReleaseEvent,
-    MouseMoveEvent, RecoverySpec, ScrollEvent, StratFile, SyncPointEvent, WaitEvent,
+    MouseMoveEvent, RecoverySpec, ScrollEvent, StratFile, SyncPointEvent,
 )
+
+log = logging.getLogger("tds_macro.recorder")
 
 
 def _dist(a: Point, b: Point) -> float:
@@ -148,24 +151,30 @@ class Recorder:
         self.clock = clock
         self._geo = None
         self._coords: Optional[Coordinates] = None
-        self._t0 = 0.0
+        # None (not 0.0) means "epoch unset": a clock can legitimately read 0.0 (FakeClock, or
+        # RealClock right after start), and `if not self._t0` would wrongly re-seed it (round 19 #2).
+        self._t0: Optional[float] = None
         self._sync_default_region = Rect(0.0, 0.0, 1.0, 1.0)
         dz_px = 6
         self.coalescer = EventCoalescer(double_click_ms=config.double_click_ms)
         self._dz_px = dz_px
         self._sync_count = 0
         self._pressed_keys: set = set()  # keys whose press we recorded (for paired releases)
+        self._strat_dir = ""  # set in run(); init here so build()/capture_sync_point() are safe early
 
     def _now_ms(self) -> int:
+        base = self._t0 if self._t0 is not None else 0.0  # safe if called before the epoch is seeded
         if self.clock is not None:
-            return int(self.clock.now_ms() - self._t0)
-        return int((time.monotonic() * 1000) - self._t0)
+            return int(self.clock.now_ms() - base)
+        return int((time.monotonic() * 1000) - base)
 
     def _refresh_geo(self) -> None:
         self._geo = self.window.get_geometry()
         self._coords = Coordinates(self._geo)
-        dz = self._dz_px / max(1, min(self._geo.w, self._geo.h))
-        self.coalescer.dead_zone = dz
+        # A minimized/zero-size window would make dz=6.0 (every drag misread as a click);
+        # skip the update on degenerate geometry and clamp to a sane max (recheck #w-deadzone).
+        if self._geo.w > 0 and self._geo.h > 0:
+            self.coalescer.dead_zone = min(0.5, self._dz_px / min(self._geo.w, self._geo.h))
 
     def _norm(self, x: float, y: float) -> Optional[Point]:
         if not self.window.is_frontmost():
@@ -175,17 +184,32 @@ class Recorder:
             return None
         return p
 
+    def _recording_paused(self) -> bool:
+        # Pause/Resume (GUI button or hotkey) must actually exclude input from the recording,
+        # not just toggle a flag the recorder ignores (round 18 #3). New intake is dropped while
+        # paused; releases of already-tracked keys/buttons are NEVER gated (below) so nothing
+        # gets stuck — mirrors the off-focus (R27) handling.
+        return bool(self.hotkeys is not None and self.hotkeys.events.pause.is_set())
+
     # --- listener callbacks ---
     def _on_move(self, x, y):
+        if self._recording_paused() and not self.coalescer._down:
+            return  # drop free moves while paused, but keep tracking a drag in progress
         p = self._norm(x, y)
-        if p:
+        if p is not None:
             self.coalescer.on_move(p, self._now_ms())
+        elif self.coalescer._down and self.window.is_frontmost():
+            # a held drag that wandered out-of-window: keep tracking max distance
+            # (clamped) so it isn't misclassified as a click on release (recheck #w4)
+            self.coalescer.on_move(self._norm_clamped(x, y), self._now_ms())
 
     def _norm_clamped(self, x, y) -> Point:
         pt = self._coords.logical_to_norm(x, y)
         return Point(clamp01(pt.x), clamp01(pt.y))
 
     def _on_click(self, x, y, button, pressed):
+        if pressed and self._recording_paused():
+            return  # drop new presses while paused; releases of tracked buttons still pass below
         p = self._norm(x, y)
         if p is not None:
             self.coalescer.on_button(p, button, pressed, self._now_ms())
@@ -195,12 +219,16 @@ class Recorder:
             self.coalescer.on_button(self._norm_clamped(x, y), button, False, self._now_ms())
 
     def _on_scroll(self, x, y, dx, dy):
+        if self._recording_paused():  # excluded from the recording while paused (round 18 #3)
+            return
         if not self.window.is_frontmost():  # R27: ignore scrolls aimed at another app (D4 r2)
             return
         p = self._norm(x, y)
         self.coalescer.on_scroll(p, int(dx), int(dy), self._now_ms())
 
     def _on_press(self, key):
+        if self._recording_paused():  # excluded from the recording while paused (round 18 #3)
+            return
         if not self.window.is_frontmost():  # R27: ignore keys aimed at another app (D14)
             return
         if key in self._pressed_keys:  # ignore OS auto-repeat ticks while a key is held (R6)
@@ -220,6 +248,10 @@ class Recorder:
         """Grab the current window region and write a reference PNG."""
         from .pngio import frame_to_rgba_bytes, write_png
 
+        if self._geo is None:  # safe if called before run() (recheck #w11)
+            self._refresh_geo()
+        if self._t0 is None:  # share one epoch with run() so finish()'s t_ms sort stays correct (recheck #w12)
+            self._t0 = (self.clock.now_ms() if self.clock else time.monotonic() * 1000)
         region = region or self._sync_default_region
         self._sync_count += 1
         label = label or f"sync_{self._sync_count}"
@@ -237,7 +269,8 @@ class Recorder:
     def run(self, strat_path: str, header: Optional[Header] = None, poll_s: float = 0.05) -> StratFile:
         """Block recording until the stop/panic hotkey, then return the StratFile."""
         self._strat_dir = os.path.dirname(os.path.abspath(strat_path))
-        self._t0 = (self.clock.now_ms() if self.clock else time.monotonic() * 1000)
+        if self._t0 is None:  # a pre-run capture_sync_point may already have seeded the shared epoch
+            self._t0 = (self.clock.now_ms() if self.clock else time.monotonic() * 1000)  # (#w12 / round 18 #2)
         self._refresh_geo()
         self.input.start_listeners(self._on_move, self._on_click, self._on_scroll,
                                    self._on_press, self._on_release)
@@ -248,15 +281,25 @@ class Recorder:
                     ev.mark_sync.clear()
                     try:
                         self.capture_sync_point()
-                    except Exception:
-                        pass
-                self._refresh_geo()
+                    except Exception as e:
+                        log.warning("mark-sync capture failed (no sync point added): %s", e)
+                try:
+                    self._refresh_geo()  # a transient window-lookup blip (focus change,
+                except Exception:        # brief minimize) must not abort an in-progress recording
+                    pass
                 time.sleep(poll_s)
         finally:
             self.input.stop_listeners()
         return self.build(strat_path, header)
 
     def build(self, strat_path: str, header: Optional[Header] = None) -> StratFile:
+        # Drain any keys still physically held when recording stopped: stop_listeners()
+        # already nulled the release callback, so their eventual physical release fires
+        # nothing. Emit synthetic releases so every recorded press is paired (D14/D15)
+        # and replay never leaves a key stuck (round 17 #3).
+        for key in list(self._pressed_keys):
+            self.coalescer.on_key(key, False, self._now_ms())
+        self._pressed_keys.clear()
         events = self.coalescer.finish()
         geo = self._geo or self.window.get_geometry()
         hdr = header or Header()
@@ -265,5 +308,7 @@ class Recorder:
         if not hdr.reference_resolution:
             hdr.reference_resolution = {"w": int(geo.w * geo.retina), "h": int(geo.h * geo.retina)}
         hdr.retina_scale_captured_at = geo.retina
+        if not hdr.private_server_url:  # bake the private-server link into the strat (Feature A)
+            hdr.private_server_url = getattr(self.config, "private_server_url", "")
         return StratFile(header=hdr, config_overrides={}, events=events,
                          recovery=RecoverySpec(), base_dir=self._strat_dir)

@@ -50,6 +50,9 @@ def build() -> StratFile:
         mode="solo", created="2026-06-23T00:00:00Z", created_by="example",
         window_aspect=round(1600 / 900, 6), reference_resolution={"w": 3200, "h": 1800},
         retina_scale_captured_at=2.0,
+        # Set this to your TDS private-server link to always (re)join the same server;
+        # leave "" to use the lobby-click join_sequence below. (placeholder, not a real link)
+        private_server_url="",
         notes="Synthetic example. Re-record frames + coords on your Mac before real use.",
     )
     # TDS-level rejoin (lobby -> map -> start). Placeholder coords.

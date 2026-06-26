@@ -14,6 +14,7 @@
       "h": 1800
     },
     "retina_scale_captured_at": 2.0,
+    "private_server_url": "",
     "notes": "Synthetic example. Re-record frames + coords on your Mac before real use."
   },
   "config_overrides": {

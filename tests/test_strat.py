@@ -7,7 +7,7 @@ import pytest
 
 from tds_macro import strat as S
 from tds_macro.errors import StratValidationError
-from tds_macro.geometry import Point, Rect
+from tds_macro.geometry import Point
 
 
 def _valid_dict():

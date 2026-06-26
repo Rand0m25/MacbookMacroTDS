@@ -10,7 +10,6 @@ from tds_macro.capture import MockCaptureBackend
 from tds_macro.input_backend import MockInputBackend
 from tds_macro.window import MockWindowProvider
 from tds_macro.recovery import MockRecoveryController, Outcome
-from tds_macro.geometry import Point
 
 from helpers import build_player, mock_config, mk_sync
 

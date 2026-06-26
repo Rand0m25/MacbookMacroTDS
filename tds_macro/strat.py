@@ -23,7 +23,7 @@ import tempfile
 from dataclasses import dataclass, field
 from typing import Optional
 
-from .config import MatchMethod
+from .config import MatchMethod, looks_like_roblox_url
 from .errors import StratValidationError
 from .geometry import Point, Rect
 
@@ -31,6 +31,7 @@ SCHEMA_VERSION = 1
 
 ON_TIMEOUT = {"abort", "continue", "retry", "recover"}
 RECOVERY_ACTIONS = {"leave_and_restart", "reconnect_and_rejoin", "reset_and_rejoin", "stop"}
+BUTTONS = {"left", "right", "middle"}
 
 # coord tolerance: recorded points may sit a hair outside the window
 _CMIN, _CMAX = -0.05, 1.05
@@ -56,11 +57,28 @@ def _req(d: dict, key: str, ctx: str, problems: list) -> bool:
     return True
 
 
+def _req_str(d: dict, key: str, ctx: str, problems: list) -> str:
+    """Require a STRING field. A non-string (e.g. a numeric ref_frame) would later
+    crash os.path.isabs/join, so report it as a clean problem and substitute ''
+    (recheck #w12)."""
+    if not _req(d, key, ctx, problems):
+        return ""
+    v = d.get(key, "")
+    if not isinstance(v, str):
+        problems.append(f"{ctx}: '{key}' must be a string")
+        return ""
+    return v
+
+
 def _coord(v, name: str, ctx: str, problems: list) -> float:
     if not _is_num(v):
         problems.append(f"{ctx}: '{name}' must be a number, got {type(v).__name__}")
         return 0.0
-    f = float(v)
+    try:
+        f = float(v)  # float() of an absurd ~400-digit int raises OverflowError
+    except OverflowError:
+        problems.append(f"{ctx}: '{name}' is too large")
+        return 0.0
     if not (_CMIN <= f <= _CMAX):
         problems.append(f"{ctx}: '{name}'={f} is outside normalized range [0,1]")
     return f
@@ -83,7 +101,26 @@ def _num(v, default, name: str, ctx: str, problems: list, cast=float):
         # json.loads accepts NaN/Infinity; reject them rather than crash int(inf)
         problems.append(f"{ctx}: '{name}' must be a finite number, got {v}")
         return None if default is None else cast(default)
-    return cast(v)
+    if cast is int and isinstance(v, float) and not v.is_integer():
+        # a fractional float in an int field (t_ms/id/...) would silently truncate (recheck #w11)
+        problems.append(f"{ctx}: '{name}' must be a whole number, got {v}")
+        return None if default is None else cast(default)
+    try:
+        return cast(v)  # float() of a huge Python int overflows
+    except OverflowError:
+        problems.append(f"{ctx}: '{name}' is too large")
+        return None if default is None else cast(default)
+
+
+def _threshold(v, default, ctx: str, problems: list):
+    """Parse a match threshold and require it in [0,1]. score() (visual.py) is clamped to
+    [0,1] and the engine matches via ``score >= threshold``, so a hand-edited threshold > 1
+    can never match (every sync_point times out -> spurious recover/abort) and one < 0 always
+    matches (syncs fire on the wrong screen). Bound it at parse time (round 20 #2)."""
+    t = _num(v, default, "threshold", ctx, problems, cast=float)
+    if t is not None and not (0.0 <= t <= 1.0):
+        problems.append(f"{ctx}: 'threshold'={t} must be in [0.0, 1.0]")
+    return t
 
 
 def _safe_float(v, default: float) -> float:
@@ -92,7 +129,7 @@ def _safe_float(v, default: float) -> float:
         return default
     try:
         f = float(v)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):  # OverflowError: huge int
         return default
     return f if math.isfinite(f) else default
 
@@ -153,6 +190,17 @@ def _enum(v, allowed: set, name: str, ctx: str, problems: list, default=None):
         problems.append(f"{ctx}: '{name}'={v!r} not one of {sorted(allowed)}")
         return default
     return v
+
+
+def _bool(v, default: bool, name: str, ctx: str, problems: list) -> bool:
+    """Strict JSON boolean: a quoted "false"/"no" is a reported typo, not silently
+    truthy (raw bool('false') is True -> would invert the user's intent)."""
+    if v is None:
+        return default
+    if isinstance(v, bool):
+        return v
+    problems.append(f"{ctx}: '{name}' must be a boolean (true/false), got {type(v).__name__}")
+    return default
 
 
 def _no_unknown(d: dict, allowed: set, ctx: str, problems: list) -> None:
@@ -420,10 +468,10 @@ def _expect(d, ctx, problems) -> Optional[ExpectSpec]:
         problems.append(f"{ctx}: 'expect' must be an object")
         return None
     _no_unknown(e, {"ref_frame", "region", "threshold", "timeout_ms"}, f"{ctx}.expect", problems)
-    _req(e, "ref_frame", f"{ctx}.expect", problems)
+    rf = _req_str(e, "ref_frame", f"{ctx}.expect", problems)
     region = _rect(e, "region", f"{ctx}.expect", problems)
-    return ExpectSpec(e.get("ref_frame", ""), region or Rect(0, 0, 1, 1),
-                      _num(e.get("threshold"), 0.9, "threshold", f"{ctx}.expect", problems, cast=float),
+    return ExpectSpec(rf, region or Rect(0, 0, 1, 1),
+                      _threshold(e.get("threshold"), 0.9, f"{ctx}.expect", problems),
                       _num(e.get("timeout_ms"), 4000, "timeout_ms", f"{ctx}.expect", problems, cast=int))
 
 
@@ -452,14 +500,16 @@ def _build_event(d: dict, ctx: str, problems: list) -> Optional[Event]:
     if typ == "click":
         _no_unknown(d, _BASE_KEYS | {"button", "pos", "clicks", "hold_ms"}, ctx, problems)
         p = _point(d, "pos", ctx, problems, required=False)
-        return ClickEvent(eid, t, typ, comment, jitter, d.get("button", "left"), p,
+        return ClickEvent(eid, t, typ, comment, jitter,
+                          _enum(d.get("button"), BUTTONS, "button", ctx, problems, default="left"), p,
                           _num(d.get("clicks"), 1, "clicks", ctx, problems, cast=int),
                           _num(d.get("hold_ms"), 0, "hold_ms", ctx, problems, cast=int))
     if typ == "drag":
         _no_unknown(d, _BASE_KEYS | {"button", "from", "to", "duration_ms"}, ctx, problems)
         frm = _point(d, "from", ctx, problems)
         to = _point(d, "to", ctx, problems)
-        return DragEvent(eid, t, typ, comment, jitter, d.get("button", "left"),
+        return DragEvent(eid, t, typ, comment, jitter,
+                         _enum(d.get("button"), BUTTONS, "button", ctx, problems, default="left"),
                          frm or Point(0, 0), to or Point(0, 0),
                          _num(d.get("duration_ms"), 300, "duration_ms", ctx, problems, cast=int))
     if typ in ("key_press", "key_release"):
@@ -481,7 +531,7 @@ def _build_event(d: dict, ctx: str, problems: list) -> Optional[Event]:
         _no_unknown(d, _BASE_KEYS | {"label", "ref_frame", "region", "threshold", "timeout_ms",
                                      "on_timeout", "match", "poll_ms", "stability_frames",
                                      "mask", "require_settled"}, ctx, problems)
-        _req(d, "ref_frame", ctx, problems)
+        rf = _req_str(d, "ref_frame", ctx, problems)
         region = _rect(d, "region", ctx, problems)
         on_to = _enum(d.get("on_timeout"), ON_TIMEOUT, "on_timeout", ctx, problems, default="abort")
         match = None
@@ -490,23 +540,28 @@ def _build_event(d: dict, ctx: str, problems: list) -> Optional[Event]:
                 match = MatchMethod(d["match"])
             except ValueError:
                 problems.append(f"{ctx}: 'match'={d['match']!r} is not a known method")
-        return SyncPointEvent(eid, t, typ, comment, jitter, d.get("label", ""), d.get("ref_frame", ""),
+        return SyncPointEvent(eid, t, typ, comment, jitter, d.get("label", ""), rf,
                               region or Rect(0, 0, 1, 1),
-                              _num(d.get("threshold"), None, "threshold", ctx, problems, cast=float),
+                              _threshold(d.get("threshold"), None, ctx, problems),
                               _num(d.get("timeout_ms"), None, "timeout_ms", ctx, problems, cast=int),
                               on_to, match,
                               _num(d.get("poll_ms"), None, "poll_ms", ctx, problems, cast=int),
                               _num(d.get("stability_frames"), None, "stability_frames", ctx, problems, cast=int),
-                              _mask(d, ctx, problems), bool(d.get("require_settled", False)))
+                              _mask(d, ctx, problems),
+                              _bool(d.get("require_settled"), False, "require_settled", ctx, problems))
     if typ == "place_tower":
         _no_unknown(d, _BASE_KEYS | {"tower", "hotbar_slot", "pos", "settle_ms", "confirm_click", "expect"}, ctx, problems)
         p = _point(d, "pos", ctx, problems)
         slot = _num(d.get("hotbar_slot"), 1, "hotbar_slot", ctx, problems, cast=int)
         if not (1 <= slot <= 8):
             problems.append(f"{ctx}: 'hotbar_slot'={slot} must be 1..8")
+        settle = _num(d.get("settle_ms"), 250, "settle_ms", ctx, problems, cast=int)
+        if settle < 0:
+            problems.append(f"{ctx}: 'settle_ms'={settle} must be >= 0")
+            settle = 0
         return PlaceTowerEvent(eid, t, typ, comment, jitter, d.get("tower", ""), slot, p or Point(0, 0),
-                               _num(d.get("settle_ms"), 250, "settle_ms", ctx, problems, cast=int),
-                               bool(d.get("confirm_click", True)), _expect(d, ctx, problems))
+                               settle, _bool(d.get("confirm_click"), True, "confirm_click", ctx, problems),
+                               _expect(d, ctx, problems))
     if typ == "upgrade":
         _no_unknown(d, _BASE_KEYS | {"target_pos", "upgrade_button_pos", "times", "between_ms", "expect"}, ctx, problems)
         tp = _point(d, "target_pos", ctx, problems)
@@ -515,16 +570,22 @@ def _build_event(d: dict, ctx: str, problems: list) -> Optional[Event]:
         if not (1 <= times <= 50):  # bound so expand_macro can't emit a runaway click storm
             problems.append(f"{ctx}: 'times'={times} must be 1..50")
             times = max(1, min(times, 50))
+        between = _num(d.get("between_ms"), 300, "between_ms", ctx, problems, cast=int)
+        if between < 0:  # negative would reorder the expanded upgrade clicks in time
+            problems.append(f"{ctx}: 'between_ms'={between} must be >= 0")
+            between = 0
         return UpgradeEvent(eid, t, typ, comment, jitter, tp or Point(0, 0), up or Point(0, 0),
-                            times, _num(d.get("between_ms"), 300, "between_ms", ctx, problems, cast=int),
-                            _expect(d, ctx, problems))
+                            times, between, _expect(d, ctx, problems))
     if typ == "ability":
         _no_unknown(d, _BASE_KEYS | {"tower_pos", "ability_button_pos", "confirm", "confirm_pos"}, ctx, problems)
         twp = _point(d, "tower_pos", ctx, problems)
         abp = _point(d, "ability_button_pos", ctx, problems)
-        cp = _point(d, "confirm_pos", ctx, problems, required=False)
+        confirm = _bool(d.get("confirm"), False, "confirm", ctx, problems)
+        # if confirm is requested, confirm_pos is required (else expand_macro silently
+        # drops the confirm click and the ability never fires) — recheck #w2.1
+        cp = _point(d, "confirm_pos", ctx, problems, required=confirm)
         return AbilityEvent(eid, t, typ, comment, jitter, twp or Point(0, 0), abp or Point(0, 0),
-                            bool(d.get("confirm", False)), cp)
+                            confirm, cp)
     problems.append(f"{ctx}: unknown event type {typ!r}")
     return None
 
@@ -595,6 +656,7 @@ class Header:
     window_aspect: float = 0.0
     reference_resolution: dict = field(default_factory=dict)
     retina_scale_captured_at: float = 1.0
+    private_server_url: str = ""  # join this server by opening the link (Feature A)
     notes: str = ""
 
     def to_dict(self):
@@ -625,12 +687,12 @@ def _detector(d, name, ctx, problems) -> Optional[DetectorSpec]:
         problems.append(f"{ctx}.{name}: must be an object")
         return None
     _no_unknown(d, {"ref_frame", "region", "threshold", "action", "mask"}, f"{ctx}.{name}", problems)
-    _req(d, "ref_frame", f"{ctx}.{name}", problems)
+    rf = _req_str(d, "ref_frame", f"{ctx}.{name}", problems)
     region = _rect(d, "region", f"{ctx}.{name}", problems)
     action = _enum(d.get("action"), RECOVERY_ACTIONS, "action", f"{ctx}.{name}", problems,
                    default="leave_and_restart")
-    return DetectorSpec(d.get("ref_frame", ""), region or Rect(0, 0, 1, 1),
-                        _num(d.get("threshold"), 0.88, "threshold", f"{ctx}.{name}", problems, cast=float),
+    return DetectorSpec(rf, region or Rect(0, 0, 1, 1),
+                        _threshold(d.get("threshold"), 0.88, f"{ctx}.{name}", problems),
                         action, _mask(d, f"{ctx}.{name}", problems))
 
 
@@ -721,6 +783,9 @@ def parse(data: dict, base_dir: str = "", check_frames: bool = True) -> StratFil
                 "strat (top level)", problems)
 
     header = Header.from_dict(data.get("header", {}))
+    if header.private_server_url and not looks_like_roblox_url(str(header.private_server_url)):
+        problems.append("header.private_server_url must be a Roblox link "
+                        "(https://...roblox.com... or roblox://...)")
 
     def _events(key) -> list:
         raw = data.get(key, []) or []
@@ -742,6 +807,8 @@ def parse(data: dict, base_dir: str = "", check_frames: bool = True) -> StratFil
     if rec is not None and not isinstance(rec, dict):
         problems.append("recovery must be an object")
     rec_raw = rec if isinstance(rec, dict) else {}
+    # a typo'd key (e.g. "wrng_map") would silently drop a recovery detector
+    _no_unknown(rec_raw, {"wrong_map", "disconnect", "lobby_anchor"}, "recovery", problems)
     recovery = RecoverySpec(
         _detector(rec_raw.get("wrong_map"), "wrong_map", "recovery", problems),
         _detector(rec_raw.get("disconnect"), "disconnect", "recovery", problems),
@@ -852,8 +919,9 @@ def expand_macro(ev: Event) -> list[Event]:
         out.append(KeyReleaseEvent(ev.id, t + _KEY_GAP, "key_release", key=key))
         out.append(MouseMoveEvent(ev.id, t + _KEY_GAP + 10, "mouse_move", pos=ev.pos, duration_ms=_MOVE_DUR))
         last = t + _KEY_GAP + 10 + _MOVE_DUR + _POST_MOVE
-        if ev.confirm_click:
-            out.append(ClickEvent(ev.id, last, "click", pos=ev.pos, comment=f"place {ev.tower}"))
+        # The placement click is ALWAYS emitted: in TDS an armed tower is only placed BY
+        # clicking, so a confirm_click=False path produced an unplaceable tower (recheck #w-place).
+        out.append(ClickEvent(ev.id, last, "click", pos=ev.pos, comment=f"place {ev.tower}"))
         end = last + ev.settle_ms
         if ev.expect:
             out.append(_expect_sync(ev.expect, ev.id, end))

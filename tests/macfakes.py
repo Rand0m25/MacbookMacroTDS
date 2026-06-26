@@ -148,6 +148,25 @@ def make_pynput():
 
     keyboard.GlobalHotKeys = GlobalHotKeys
 
+    _KNOWN = set(_SPECIALS)
+
+    class HotKey:
+        @staticmethod
+        def parse(combo):
+            import re
+            if not combo:
+                raise ValueError("empty hotkey")
+            for tok in combo.split("+"):
+                m = re.fullmatch(r"<([^>]+)>", tok)
+                if m:
+                    if m.group(1) not in _KNOWN:
+                        raise ValueError(f"unknown key {m.group(1)!r}")
+                elif len(tok) != 1:
+                    raise ValueError(f"bad token {tok!r}")
+            return []
+
+    keyboard.HotKey = HotKey
+
     pynput.mouse = mouse
     pynput.keyboard = keyboard
     return {"pynput": pynput, "pynput.mouse": mouse, "pynput.keyboard": keyboard}
@@ -164,6 +183,9 @@ def make_mss(scale=1):
     class FakeSct:
         def __init__(self):
             self.grabs = []
+            # monitors[0] is the bounding box of all monitors (points); large enough that
+            # normal in-bounds grabs pass through _clamp_rect_to_bounds unchanged.
+            self.monitors = [{"left": 0, "top": 0, "width": 5120, "height": 2880}]
 
         def grab(self, region):
             self.grabs.append(dict(region))

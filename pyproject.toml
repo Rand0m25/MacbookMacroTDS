@@ -18,8 +18,16 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0", "numpy>=2.0"]
+dev = ["pytest>=8.0", "numpy>=2.0", "ruff>=0.5", "pyflakes>=3.0", "mypy>=1.0"]
 cv = ["opencv-python>=4.9"]
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+# E702 (multiple statements per line via ';') is intentional for compact argparse
+# setup + a few tight loops; everything else (F-undefined/unused, E4 imports, E9) enforced.
+ignore = ["E702"]
 
 [project.scripts]
 tds-macro = "tds_macro.cli:main"

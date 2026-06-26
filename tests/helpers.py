@@ -40,7 +40,7 @@ def mk_sync(eid, t, label, *, timeout=8000, on_timeout="abort", stability_frames
 
 
 def build_player(strat, *, cfg=None, capture=None, clock=None, recovery=None,
-                 hotkeys=None, input_backend=None, comparator=None, window=None):
+                 hotkeys=None, input_backend=None, comparator=None, window=None, launcher=None):
     cfg = cfg or mock_config()
     window = window or MockWindowProvider(rect=(0, 0, 1600, 900))
     input_backend = input_backend or MockInputBackend()
@@ -49,5 +49,5 @@ def build_player(strat, *, cfg=None, capture=None, clock=None, recovery=None,
     clock = clock or FakeClock()
     recovery = recovery or MockRecoveryController()
     player = Player(strat, window, input_backend, capture, comparator, clock, recovery, cfg,
-                    hotkeys=hotkeys, ref_loader=ref_loader)
+                    hotkeys=hotkeys, ref_loader=ref_loader, launcher=launcher)
     return player, input_backend, capture, clock

@@ -36,7 +36,10 @@ class Outcome(str, Enum):
     STOP = "stop"          # unrecoverable / budget exhausted -> halt + notify
 
 
-class RecoveryController(Protocol):
+class RecoveryControllerProtocol(Protocol):
+    # the interface the engine depends on; the concrete RecoveryController (below) and
+    # MockRecoveryController both satisfy it. (Renamed so it isn't shadowed by the concrete
+    # class of the same name — recheck #w-redef.)
     def classify(self, window: Frame) -> FailureMode: ...
     def handle(self, reason, *, scene: Optional[Frame] = None) -> Outcome: ...
 
@@ -84,7 +87,8 @@ class MockRecoveryController:
 class RecoveryController:
     """The user-mandated leave/reset->lobby->rejoin machine, fully bounded."""
 
-    def __init__(self, strat, window, input_backend, capture, comparator, clock, config) -> None:
+    def __init__(self, strat, window, input_backend, capture, comparator, clock, config,
+                 launcher=None) -> None:
         self.strat = strat
         self.window = window
         self.input = input_backend
@@ -92,6 +96,10 @@ class RecoveryController:
         self.comparator = comparator
         self.clock = clock
         self.config = config
+        if launcher is None:
+            from .launcher import make_launcher
+            launcher = make_launcher(config)
+        self.launcher = launcher
         self.attempts: dict[str, int] = {}
 
     def _coerce(self, reason) -> FailureMode:
@@ -111,7 +119,7 @@ class RecoveryController:
         log.info("recovery: handling %s (attempt %d/%d)", fm.value, n, self.config.max_attempts_per_cause)
         return False
 
-    def classify(self, window: Optional[Frame]) -> FailureMode:
+    def classify(self, window: Optional[Frame], *, live: bool = True) -> FailureMode:
         if window is None:
             return FailureMode.STUCK_SYNC
         rec = self.strat.recovery
@@ -124,7 +132,9 @@ class RecoveryController:
             return FailureMode.DEFEAT
         if re and re.victory and self._match(window, re.victory):
             return FailureMode.VICTORY
-        if not self.window.is_frontmost():
+        # FOCUS_LOST is a LIVE-only decision; never derive it from a captured/stale frame
+        # (e.g. the stuck-sync reclassify), or a stuck sync gets mis-handled (recheck #w-classify-live)
+        if live and not self.window.is_frontmost():
             return FailureMode.FOCUS_LOST
         return FailureMode.NONE
 
@@ -153,6 +163,11 @@ class RecoveryController:
         fm = self._coerce(reason)
         if fm in (FailureMode.NONE,):
             return Outcome.RESUME
+        # DEFEAT/VICTORY are normal end-of-run terminators (classify() can return them,
+        # incl. via a stuck-sync reclassify); they must NOT charge a recovery budget,
+        # else >max_attempts healthy runs would STOP the bot (recheck #w3/#w4).
+        if fm in (FailureMode.DEFEAT, FailureMode.VICTORY):
+            return Outcome.REJOIN
         if self._over_budget(fm):
             return Outcome.STOP
 
@@ -171,8 +186,11 @@ class RecoveryController:
         if fm in (FailureMode.WRONG_MAP, FailureMode.STUCK_SYNC, FailureMode.OUT_OF_CASH,
                   FailureMode.STATE_MISMATCH):
             if fm == FailureMode.STUCK_SYNC and scene is not None:
-                deeper = self.classify(scene)
+                deeper = self.classify(scene, live=False)  # reclassify the frame, not live focus
                 if deeper not in (FailureMode.NONE, FailureMode.STUCK_SYNC):
+                    # a stuck sync that's really a known cause -> don't burn the stuck_sync
+                    # budget for the misclassification, or confirmed recoveries still hit STOP (recheck #7)
+                    self.attempts[fm.value] = 0
                     return self.handle(deeper, scene=scene)
             if self._leave_and_reset():
                 self.attempts[fm.value] = 0  # confirmed reach of lobby -> reset budget
@@ -190,18 +208,15 @@ class RecoveryController:
         return self._match(self.capture.grab_window(geo), det)
 
     def _relaunch_experience(self) -> bool:
-        """Hard-disconnect-to-website fallback: re-open the Roblox experience URL."""
-        url = getattr(self.config, "relaunch_url", "")
+        """Hard-disconnect-to-website fallback: re-open the server. Prefers the private-
+        server link (so we always land back in the SAME server), then relaunch_url."""
+        url = (getattr(self.config, "private_server_url", "")
+               or getattr(self.strat.header, "private_server_url", "")
+               or getattr(self.config, "relaunch_url", ""))
         if not url or self.config.dry_run:
             return False
-        log.info("recovery: relaunching Roblox experience %s", url)
-        try:
-            import subprocess
-
-            subprocess.run(["open", url], check=False, capture_output=True, timeout=5)
-            return True
-        except Exception:
-            return False
+        log.info("recovery: relaunching Roblox experience")
+        return self.launcher.open_url(url)
 
     # --- Roblox-client-level actions (the stable backbone, plan section 8) ---
     def _reconnect(self) -> bool:
@@ -261,9 +276,14 @@ class RecoveryController:
 
         geo = self.window.get_geometry()
         coords = Coordinates(geo)
+        # Honor the recorded inter-event timing (the recorder stores gaps as each
+        # event's absolute t_ms, not as WaitEvents) so menu navigation isn't fired
+        # back-to-back too fast for Roblox to register (R-recheck #5).
+        t0 = self.clock.now_ms()
         for e in expand_all(events):
+            self.clock.sleep_until(t0 + e.t_ms)
             if isinstance(e, WaitEvent):
-                self.clock.sleep(e.duration_ms)
+                continue  # the sleep_until above already realized the delay
             elif isinstance(e, MouseMoveEvent):
                 px, py = coords.norm_to_logical(e.pos)
                 self.input.move(px, py, e.duration_ms)

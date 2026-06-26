@@ -105,7 +105,7 @@ class Coordinates:
     # --- B: absolute logical points -> normalized (recorder) ---
     def logical_to_norm(self, px: float, py: float) -> Point:
         g = self.geo
-        return Point((px - g.x) / g.w, (py - g.y) / g.h)
+        return Point((px - g.x) / max(1, g.w), (py - g.y) / max(1, g.h))
 
     # --- C: normalized -> physical pixels, relative to the grabbed monitor ---
     def norm_to_physical(self, p: Point) -> tuple[float, float]:
@@ -117,8 +117,9 @@ class Coordinates:
     # --- D: physical pixels -> normalized (inverse of C) ---
     def physical_to_norm(self, px_phys: float, py_phys: float) -> Point:
         g = self.geo
-        nx = ((px_phys / g.retina) - (g.x - g.monitor_x)) / g.w
-        ny = ((py_phys / g.retina) - (g.y - g.monitor_y)) / g.h
+        retina = g.retina or 1.0
+        nx = ((px_phys / retina) - (g.x - g.monitor_x)) / max(1, g.w)
+        ny = ((py_phys / retina) - (g.y - g.monitor_y)) / max(1, g.h)
         return Point(nx, ny)
 
     # --- E: crop box for a normalized region inside a window image (Iw,Ih) ---

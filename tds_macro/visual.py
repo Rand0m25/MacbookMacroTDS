@@ -182,22 +182,33 @@ def load_reference(path: str) -> Frame:
     :mod:`pngio` (needs only numpy). The comparator scores on a channel-mean
     grayscale, so RGB-vs-BGR ordering is irrelevant.
     """
+    # Each backend: a MISSING backend (ImportError) is skipped; a DECODE failure
+    # falls through to the next reader (so the documented chain actually holds).
     try:
         from PIL import Image  # type: ignore
         import numpy as np  # type: ignore
-
-        return Frame.from_numpy(np.asarray(Image.open(path).convert("RGBA")), label=path)
+        _pil = (Image, np)
     except ImportError:
-        pass
+        _pil = None
+    if _pil is not None:
+        try:
+            Image, np = _pil
+            return Frame.from_numpy(np.asarray(Image.open(path).convert("RGBA")), label=path)
+        except Exception:
+            pass  # not decodable by Pillow -> try the next reader
     try:
         import cv2  # type: ignore
-
-        arr = cv2.imread(path, cv2.IMREAD_UNCHANGED)
-        if arr is not None:
-            return Frame.from_numpy(arr, label=path)
+        _cv2 = cv2
     except ImportError:
-        pass
-    # stdlib fallback (numpy only)
+        _cv2 = None
+    if _cv2 is not None:
+        try:
+            arr = _cv2.imread(path, _cv2.IMREAD_UNCHANGED)
+            if arr is not None:
+                return Frame.from_numpy(arr, label=path)
+        except Exception:
+            pass
+    # stdlib fallback (numpy only) — raises a clear error if this can't read it either
     import numpy as np  # type: ignore
     from .pngio import read_png
 

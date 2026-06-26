@@ -10,6 +10,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, fields
 from enum import Enum
+from urllib.parse import urlparse
 
 
 class InputBackendKind(str, Enum):
@@ -34,6 +35,27 @@ class MatchMethod(str, Enum):
     SSIM = "ssim"
     MSE = "mse"
     PHASH = "phash"
+
+
+def looks_like_roblox_url(url: str) -> bool:
+    """True if the string is plausibly a Roblox link we can `open` to join a server
+    (a roblox:// deep link or an https roblox.com / ro.blox.com share link)."""
+    u = (url or "").strip().lower()
+    if u.startswith("roblox://") or u.startswith("roblox-player:"):
+        return True
+    if u.startswith("http://") or u.startswith("https://"):
+        # Parse the host instead of a bare substring test: "roblox.com" in u would also accept
+        # roblox.com.evil.example / evilroblox.com / ?ref=roblox.com and then hand that URL to the
+        # OS `open`, letting a typo'd or hostile link steer the join (round 21 #3).
+        host = urlparse(u).hostname or ""
+        return (host in ("roblox.com", "ro.blox.com")
+                or host.endswith(".roblox.com") or host.endswith(".ro.blox.com"))
+    return False
+
+
+# Fields that are declared Optional and may legitimately be set back to None via an override.
+# Every other field is non-nullable (None would crash validate()/playback).
+_NULLABLE_FIELDS = frozenset({"retina_scale_override", "window_rect_override"})
 
 
 @dataclass
@@ -87,6 +109,8 @@ class Config:
     # --- window / display ---
     window_title_match: str = "Roblox"
     relaunch_url: str = ""  # roblox://... or https experience URL for RELAUNCH_EXPERIENCE fallback
+    private_server_url: str = ""  # roblox private-server link; join by opening it (preferred over join_sequence)
+    join_timeout_ms: int = 30000  # how long to wait for the server to load after opening the link
     retina_scale_override: float | None = None
     window_rect_override: tuple[int, int, int, int] | None = None  # (x,y,w,h) for mock/tests
     aspect_warn_tolerance: float = 0.02
@@ -141,7 +165,12 @@ class Config:
         '100' becomes 100 (and is rejected if non-convertible) instead of crashing
         deep in playback arithmetic (R6)."""
         if value is None:
-            return value
+            # Key off the field's declared nullability, not the CURRENT value: a nullable field
+            # that already holds a value must still be clearable back to None (round 20 #1).
+            # JSON null on any other field would crash validate()/playback -> reject it.
+            if key in _NULLABLE_FIELDS:
+                return None
+            raise ValueError(f"{key} must not be null")
         if isinstance(current, bool):  # bool BEFORE int (bool is an int subclass)
             if isinstance(value, bool):
                 return value
@@ -154,14 +183,24 @@ class Config:
                 raise ValueError(f"{key} must be a boolean")
             return bool(value)
         if isinstance(current, int):
-            if isinstance(value, float) and not math.isfinite(value):
+            if isinstance(value, int):  # bool handled above; exact, skip the float round-trip
+                return value
+            try:
+                f = float(value)  # accepts "100"; "12.5"/"abc"/1.9 are rejected clearly below
+            except (TypeError, ValueError):
+                raise ValueError(f"{key} must be an integer")
+            if not math.isfinite(f):
                 raise ValueError(f"{key} must be a finite integer")
-            return int(value)
+            if not f.is_integer():  # don't silently truncate 1.9 -> 1 (round 17 #1)
+                raise ValueError(f"{key} must be an integer, got {value!r}")
+            return int(f)
         if isinstance(current, float):
             f = float(value)
             if not math.isfinite(f):
                 raise ValueError(f"{key} must be a finite number")
             return f
+        if isinstance(current, str) and not isinstance(value, str):
+            return str(value)  # str field given a non-string -> coerce (don't crash str consumers)
         return value
 
     def validate(self) -> list[str]:
@@ -177,6 +216,14 @@ class Config:
             problems.append("loop_count must be >= 0")
         if self.max_attempts_per_cause < 1:
             problems.append("max_attempts_per_cause must be >= 1")
+        if self.recovery_check_every_ms <= 0:
+            problems.append("recovery_check_every_ms must be > 0")  # else _wait_run_end hangs/busy-spins
+        if self.retina_scale_override is not None and self.retina_scale_override <= 0:
+            problems.append("retina_scale_override must be > 0")
+        if self.private_server_url and not looks_like_roblox_url(self.private_server_url):
+            problems.append("private_server_url must be a Roblox link (https://...roblox.com... or roblox://...)")
+        if self.join_timeout_ms <= 0:
+            problems.append("join_timeout_ms must be > 0")
         return problems
 
     def min_sync_timeout_ms(self) -> int:

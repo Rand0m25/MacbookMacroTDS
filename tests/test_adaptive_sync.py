@@ -55,16 +55,38 @@ def test_timeout_when_never_matches():
     assert clk.now_ms() >= 1000
 
 
-def test_rising_edge_gate_needs_transition():  # S2
-    # require_settled => must see a non-match before accepting; an always-matching
-    # (lingering previous-loop) screen must NOT instantly satisfy the sync.
+def test_require_settled_fires_on_stable_match():  # S2 / recheck #w2.2
+    # require_settled now means "wait for the screen to settle", NOT "require a
+    # transition". An already-stable matching screen must FIRE, not spuriously
+    # time out into recovery (the strict rising-edge hang was a bug).
     cap = MockCaptureBackend(current_label="s")
     clk = FakeClock()
     p = _player(cap, clk)
-    sync = mk_sync(1, 0, "s", timeout=800, require_settled=True)
+    sync = mk_sync(1, 0, "s", timeout=800, require_settled=True, stability_frames=1)
     sync.poll_ms = 100
     res, _ = p._adaptive_wait(sync)
-    assert res == WaitResult.TIMEOUT  # no edge -> never fires
+    assert res == WaitResult.FIRE  # already stable + matching -> fires (no spurious timeout)
+
+
+def test_require_settled_runs_a_settle_check_even_at_stability_one():  # recheck #w-settle
+    # require_settled must not fire on the bare first frame (no settle comparison possible);
+    # it fires only after >=1 frame-to-frame settle check, even when stability_frames==1.
+    cap = MockCaptureBackend(current_label="s")
+    clk = FakeClock()
+    p = _player(cap, clk)
+    sync = mk_sync(1, 0, "s", require_settled=True, stability_frames=1, timeout=5000)
+    sync.poll_ms = 100
+    res, _ = p._adaptive_wait(sync)
+    assert res == WaitResult.FIRE
+    assert clk.now_ms() >= 100  # advanced >=1 poll -> a settle check actually ran
+
+    # contrast: a plain sync (no require_settled) fires on the very first frame
+    clk2 = FakeClock()
+    p2 = _player(MockCaptureBackend(current_label="s"), clk2)
+    s2 = mk_sync(2, 0, "s", stability_frames=1, timeout=5000)
+    s2.poll_ms = 100
+    r2, _ = p2._adaptive_wait(s2)
+    assert r2 == WaitResult.FIRE and clk2.now_ms() == 0
 
 
 def test_rising_edge_fires_after_transition():  # S2

@@ -76,9 +76,13 @@ def read_png(path: str) -> tuple[bytes, int, int, int]:
     width = height = bit_depth = color_type = interlace = 0
     idat = bytearray()
     while pos < len(raw):
+        if pos + 12 > len(raw):  # need 4 len + 4 tag + ... + 4 crc; reject truncated headers cleanly
+            raise ValueError("corrupt PNG: truncated chunk header")
         length = struct.unpack(">I", raw[pos:pos + 4])[0]
         tag = raw[pos + 4:pos + 8]
         data = raw[pos + 8:pos + 8 + length]
+        if pos + 12 + length > len(raw):  # chunk body runs past EOF
+            raise ValueError("corrupt PNG: truncated chunk body")
         pos += 12 + length  # length + tag + data + crc
         if tag == b"IHDR":
             width, height, bit_depth, color_type, _, _, interlace = struct.unpack(">IIBBBBB", data)
@@ -92,6 +96,8 @@ def read_png(path: str) -> tuple[bytes, int, int, int]:
     channels = 4 if color_type == 6 else 3
     stride = width * channels
     decompressed = zlib.decompress(bytes(idat))
+    if len(decompressed) < (stride + 1) * height:  # IHDR dims vs actual scanline data
+        raise ValueError("corrupt PNG: scanline data shorter than the IHDR dimensions declare")
     out = bytearray(stride * height)
     prev = bytearray(stride)
     src = 0
