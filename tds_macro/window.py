@@ -152,9 +152,14 @@ class QuartzWindowProvider:
         # (check=False means a non-zero exit doesn't raise) — recheck #w8.1
         candidates = list(dict.fromkeys([*self._owner_names, *self.OWNER_NAMES]))
         for name in candidates:
+            # Escape for the AppleScript string literal: window_title_match can come from an
+            # untrusted strat's config_overrides, and an unescaped " would let it break out and
+            # inject AppleScript/shell (round 22 #L). Escaping \ and " keeps it inside the literal;
+            # a newline would just make invalid AppleScript that fails safely (and validate() rejects it).
+            safe = name.replace("\\", "\\\\").replace('"', '\\"')
             try:
                 proc = subprocess.run(
-                    ["osascript", "-e", f'tell application "{name}" to activate'],
+                    ["osascript", "-e", f'tell application "{safe}" to activate'],
                     check=False, capture_output=True, timeout=3,
                 )
                 if proc.returncode == 0:
@@ -164,14 +169,36 @@ class QuartzWindowProvider:
         log.warning("could not activate the Roblox window via osascript (tried %s)", candidates)
 
 
+class _GeometryOverrideProvider:
+    """Pins geometry to an override rect (the --window-rect / test flag) but delegates is_frontmost()
+    and activate() to the REAL provider. Without this, a real-Mac run with --window-rect got a
+    MockWindowProvider whose is_frontmost() is always True + activate() is a no-op, so the engine
+    injected clicks while Roblox was backgrounded and recovery could never refocus it (round 22c #14)."""
+
+    def __init__(self, real, rect, retina):
+        self._real = real
+        self._geo = MockWindowProvider(rect=rect, retina=retina)  # reuse its WindowGeometry construction
+
+    def get_geometry(self) -> WindowGeometry:
+        return self._geo.get_geometry()
+
+    def is_frontmost(self) -> bool:
+        return self._real.is_frontmost()
+
+    def activate(self) -> None:
+        self._real.activate()
+
+
 def make_window_provider(config: Config) -> WindowProvider:
-    if config.window_backend == WindowBackendKind.MOCK or config.window_rect_override is not None:
-        # On a real Mac (QUARTZ) with a rect override but no explicit retina, mirror the
-        # Quartz 2.0 default so physical-pixel conversions aren't off by 2x (recheck #w8.2);
-        # an explicit MOCK backend stays at 1.0 (internally consistent with mock capture).
-        default_retina = 2.0 if config.window_backend == WindowBackendKind.QUARTZ else 1.0
+    if config.window_backend == WindowBackendKind.MOCK:
         return MockWindowProvider(
             rect=config.window_rect_override or (0, 0, 1600, 900),
-            retina=config.retina_scale_override or default_retina,
+            retina=config.retina_scale_override or 1.0,  # mock stays internally consistent at 1.0
         )
+    # QUARTZ. A rect override pins geometry but must NOT fake focus: wrap the REAL provider so
+    # is_frontmost()/activate() stay real while geometry comes from the override (recheck #w8.2 keeps
+    # the 2.0 retina default; the focus-safety part is round 22c #14).
+    if config.window_rect_override is not None:
+        retina = config.retina_scale_override if config.retina_scale_override is not None else 2.0
+        return _GeometryOverrideProvider(QuartzWindowProvider(config), config.window_rect_override, retina)
     return QuartzWindowProvider(config)

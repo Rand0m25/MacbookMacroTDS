@@ -47,7 +47,7 @@ def test_upgrade_times_bounded():
                              "target_pos": {"x": 0.5, "y": 0.5},
                              "upgrade_button_pos": {"x": 0.9, "y": 0.7}, "times": 9999}]},
                 check_frames=False)
-    assert any("times" in p and "1..50" in p for p in ei.value.problems)
+    assert any("times" in p and "50" in p for p in ei.value.problems)  # bound now reported via _num lo/hi (round 22d)
 
 
 # 4) a restart is NOT a completed run, releases input, and is bounded

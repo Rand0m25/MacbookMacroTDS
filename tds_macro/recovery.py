@@ -16,6 +16,10 @@ from .frame import Frame
 
 log = logging.getLogger("tds_macro.recovery")
 
+# How many times to recheck is_frontmost() (sleeping recovery_check_every_ms between)
+# after an async activate() before giving up on a FOCUS_LOST recovery (round 22 #J).
+_FOCUS_SETTLE_TRIES = 5
+
 
 class FailureMode(str, Enum):
     NONE = "none"
@@ -173,10 +177,16 @@ class RecoveryController:
 
         if fm == FailureMode.FOCUS_LOST:
             self.window.activate()
-            if self.window.is_frontmost():
-                self.attempts[fm.value] = 0  # confirmed -> fresh budget next time
-                return Outcome.RESUME
-            return Outcome.STOP
+            # activate() shells `osascript ... activate`, which is ASYNCHRONOUS: returncode 0 only
+            # means the Apple Event was dispatched, not that focus has landed. Checking is_frontmost()
+            # on the very next line would STOP the bot on a transient blip without using the per-cause
+            # budget. Give focus a bounded settle window of rechecks first (round 22 #J).
+            for _ in range(_FOCUS_SETTLE_TRIES):
+                if self.window.is_frontmost():
+                    self.attempts[fm.value] = 0  # confirmed -> fresh budget next time
+                    return Outcome.RESUME
+                self.clock.sleep(max(1, self.config.recovery_check_every_ms))
+            return Outcome.STOP  # genuinely couldn't regain focus -> don't dispatch into the wrong app
         if fm == FailureMode.DISCONNECTED:
             if self._reconnect():
                 self.attempts[fm.value] = 0
@@ -212,7 +222,7 @@ class RecoveryController:
         server link (so we always land back in the SAME server), then relaunch_url."""
         url = (getattr(self.config, "private_server_url", "")
                or getattr(self.strat.header, "private_server_url", "")
-               or getattr(self.config, "relaunch_url", ""))
+               or getattr(self.config, "relaunch_url", "")).strip()  # `open` won't trim; mirror engine (round 22c #11)
         if not url or self.config.dry_run:
             return False
         log.info("recovery: relaunching Roblox experience")
@@ -306,3 +316,7 @@ class RecoveryController:
                     px, py = coords.norm_to_logical(e.pos)
                     self.input.move(px, py)
                 self.input.scroll(e.dx, e.dy)
+            else:
+                # no SyncPointEvent (or other) branch here; parse() rejects those in
+                # leave_reset_sequence, but warn rather than silently drop if one slips through (round 23 #5)
+                log.warning("recovery sequence: skipping unsupported event type %r", e.type)

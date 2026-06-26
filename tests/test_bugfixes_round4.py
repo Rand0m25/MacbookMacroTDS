@@ -120,4 +120,4 @@ def test_press_key_records_before_press():
         b._ensure()
         with pytest.raises(RuntimeError):
             b.press_key("a", modifiers=["ctrl"])
-        assert {"ctrl", "a"} <= b._held_keys  # both recorded before their press
+        assert {"ctrl", "a"} <= set(b._held_keys)  # both recorded before their press (refcount dict now)

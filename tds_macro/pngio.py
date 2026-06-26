@@ -85,6 +85,8 @@ def read_png(path: str) -> tuple[bytes, int, int, int]:
             raise ValueError("corrupt PNG: truncated chunk body")
         pos += 12 + length  # length + tag + data + crc
         if tag == b"IHDR":
+            if len(data) != 13:  # IHDR is exactly 13 bytes; a wrong length -> clean ValueError, not struct.error (round 22 #D)
+                raise ValueError("corrupt PNG: bad IHDR length")
             width, height, bit_depth, color_type, _, _, interlace = struct.unpack(">IIBBBBB", data)
         elif tag == b"IDAT":
             idat += data
@@ -95,7 +97,10 @@ def read_png(path: str) -> tuple[bytes, int, int, int]:
                          f"interlace={interlace}); install Pillow for this image")
     channels = 4 if color_type == 6 else 3
     stride = width * channels
-    decompressed = zlib.decompress(bytes(idat))
+    try:
+        decompressed = zlib.decompress(bytes(idat))
+    except zlib.error as e:  # zero/garbage IDAT -> clean ValueError like every other path (round 22c #3)
+        raise ValueError(f"corrupt PNG: bad IDAT/deflate stream ({e})") from e
     if len(decompressed) < (stride + 1) * height:  # IHDR dims vs actual scanline data
         raise ValueError("corrupt PNG: scanline data shorter than the IHDR dimensions declare")
     out = bytearray(stride * height)

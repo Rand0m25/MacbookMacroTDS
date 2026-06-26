@@ -44,10 +44,17 @@ def looks_like_roblox_url(url: str) -> bool:
     if u.startswith("roblox://") or u.startswith("roblox-player:"):
         return True
     if u.startswith("http://") or u.startswith("https://"):
+        if "\\" in u:
+            # browsers normalize backslashes to slashes (WHATWG) but urlparse doesn't, so
+            # 'https://evil.com\\@roblox.com' parses as host roblox.com here yet opens evil.com -> reject (round 23 #8)
+            return False
         # Parse the host instead of a bare substring test: "roblox.com" in u would also accept
         # roblox.com.evil.example / evilroblox.com / ?ref=roblox.com and then hand that URL to the
         # OS `open`, letting a typo'd or hostile link steer the join (round 21 #3).
-        host = urlparse(u).hostname or ""
+        try:
+            host = urlparse(u).hostname or ""
+        except ValueError:
+            return False  # malformed host (e.g. 'http://[::1') -> not a valid link, not a crash (round 22 #A)
         return (host in ("roblox.com", "ro.blox.com")
                 or host.endswith(".roblox.com") or host.endswith(".ro.blox.com"))
     return False
@@ -97,7 +104,8 @@ class Config:
     session_max_minutes: int = 0  # 0 == no cap
     break_every_runs: int = 0  # 0 == no breaks
     break_seconds: int = 0
-    require_consent: bool = True  # first-run ban-risk acknowledgement gate (R18)
+    # (the ban-risk consent gate is enforced unconditionally in cli._check_consent via the consent
+    #  file + --accept-ban-risk; it is intentionally NOT a config knob a strat could disable.)
 
     # --- hotkeys ---
     panic_hotkey: str = "f8"
@@ -183,7 +191,11 @@ class Config:
                 raise ValueError(f"{key} must be a boolean")
             return bool(value)
         if isinstance(current, int):
-            if isinstance(value, int):  # bool handled above; exact, skip the float round-trip
+            if isinstance(value, bool):
+                # bool is an int subclass and the bool-branch above keys off the CURRENT value
+                # (an int), so True/False would slip through as 1/0 — reject the typo (round 22 #C).
+                raise ValueError(f"{key} must be an integer, got {value!r}")
+            if isinstance(value, int):  # exact, skip the float round-trip
                 return value
             try:
                 f = float(value)  # accepts "100"; "12.5"/"abc"/1.9 are rejected clearly below
@@ -195,6 +207,8 @@ class Config:
                 raise ValueError(f"{key} must be an integer, got {value!r}")
             return int(f)
         if isinstance(current, float):
+            if isinstance(value, bool):  # bool is a number subclass; reject like the int branch (round 22c #1)
+                raise ValueError(f"{key} must be a number, got {value!r}")
             f = float(value)
             if not math.isfinite(f):
                 raise ValueError(f"{key} must be a finite number")
@@ -220,8 +234,20 @@ class Config:
             problems.append("recovery_check_every_ms must be > 0")  # else _wait_run_end hangs/busy-spins
         if self.retina_scale_override is not None and self.retina_scale_override <= 0:
             problems.append("retina_scale_override must be > 0")
+        if self.window_rect_override is not None and (self.window_rect_override[2] <= 0
+                                                      or self.window_rect_override[3] <= 0):
+            problems.append("window_rect_override width and height must be > 0")  # else degenerate geometry (round 22c #2)
+        if self.jitter_ms < 0:
+            problems.append("jitter_ms must be >= 0")  # round 22c #8
         if self.private_server_url and not looks_like_roblox_url(self.private_server_url):
             problems.append("private_server_url must be a Roblox link (https://...roblox.com... or roblox://...)")
+        if self.relaunch_url and not looks_like_roblox_url(self.relaunch_url):
+            # same OS-`open` gate as private_server_url — it's the recovery relaunch fallback (round 22 #B)
+            problems.append("relaunch_url must be a Roblox link (https://...roblox.com... or roblox://...)")
+        if any(c in self.window_title_match for c in '"\\\n\r'):
+            # window_title_match is interpolated into an osascript program in window.activate();
+            # quotes/backslashes/newlines could inject AppleScript from an untrusted strat (round 22 #L)
+            problems.append("window_title_match must not contain quotes, backslashes, or newlines")
         if self.join_timeout_ms <= 0:
             problems.append("join_timeout_ms must be > 0")
         return problems

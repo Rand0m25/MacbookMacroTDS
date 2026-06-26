@@ -124,7 +124,7 @@ def test_pynput_key_codec_and_release_all():
         b = _pynput_backend()
         b.press_key("e")
         b.press_key("shift")
-        assert b._held_keys == {"e", "shift"}
+        assert set(b._held_keys) == {"e", "shift"}  # _held_keys is now a refcount dict (round 22 #M)
         b.release_all()
         assert not b._held_keys
         b.release_all()  # idempotent
@@ -170,8 +170,11 @@ def test_mss_region_math_and_shape():
 # --------------------------------------------------------------------------- #
 class _FlatCapture:
     def grab_window(self, geo):
+        import numpy as np
         from tds_macro.frame import Frame
-        return Frame.labelled("black")  # zeros -> variance 0
+        # a full-window black frame (real macOS denial), not a 1x1 sliver — the size guard in
+        # check_screen_recording treats tiny grabs as inconclusive (round 22 #O)
+        return Frame.from_numpy(np.zeros((100, 100, 4), dtype="uint8"))  # zeros -> variance 0
 
 
 class _BusyCapture:

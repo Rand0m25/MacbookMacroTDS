@@ -123,8 +123,11 @@ def _check_consent(args) -> bool:
         try:
             with open(CONSENT_PATH, "w") as f:
                 f.write(datetime.now(timezone.utc).isoformat())
-        except Exception:
-            pass
+        except Exception as e:
+            # consent granted for THIS run, but couldn't persist -> say so, or every future run
+            # silently re-prompts and exits 2 (round 22b #9)
+            ui.warn(f"ban-risk acknowledged for this run but could not save it to {CONSENT_PATH} "
+                    f"({e}); you may be asked again next time")
         return True
     return os.path.exists(CONSENT_PATH)
 
@@ -195,6 +198,12 @@ def cmd_record(args) -> int:
 
     config = _build_config(args)
     config.frames_dir = args.frames_dir or "frames"
+    cfg_problems = config.validate()  # reject a bad --private-server BEFORE recording, not after
+    if cfg_problems:                  # (else you'd record a session that load() later refuses) (round 22b #8)
+        ui.err("invalid config:")
+        for p in cfg_problems:
+            print("  - " + p)
+        return 1
     window, input_backend, capture, _cmp = _build_backends(config)
     header = Header(name=args.name or "", map=args.map or "", difficulty=args.difficulty or "",
                     created=datetime.now(timezone.utc).isoformat(), created_by=os.environ.get("USER", ""))
@@ -212,7 +221,11 @@ def cmd_record(args) -> int:
         return 1
     finally:
         hk.stop()
-    save(strat, args.strat)
+    try:
+        save(strat, args.strat)
+    except OSError as e:  # read-only/missing dir, full disk: report cleanly, don't crash + lose the session (round 22 #Q)
+        ui.err(f"could not save the recording to {args.strat}: {e}")
+        return 1
     ui.ok(f"saved {len(strat.events)} events to {args.strat}")
     return 0
 
@@ -288,12 +301,18 @@ def cmd_calibrate(args) -> int:
     from .strat import load, SyncPointEvent
     from .errors import StratValidationError
 
-    config = _build_config(args)
     try:
         st = load(args.strat, check_frames=not args.no_frames)
     except (StratValidationError, OSError) as e:
         ui.err(f"could not load strat: {args.strat}")
         print(e)
+        return 1
+    try:
+        # build with the strat's config_overrides so calibrate scores with the SAME effective config
+        # the player uses (threshold/match/retina), else calibrate and play can disagree (round 22c #19)
+        config = _build_config(args, overrides=st.config_overrides)
+    except (ValueError, TypeError) as e:
+        ui.err(f"bad config_overrides in {args.strat}: {e}")
         return 1
     window, _input, capture, comparator = _build_backends(config)
     from .visual import load_reference

@@ -595,6 +595,236 @@ Trend: **5 → 4 → 4 → 2 → 2** genuine defects. Clean streak still **0/3**
 Tests: +19 (`tests/test_bugfixes_recheck19.py`) → **290 pass, ruff + pyflakes clean**.
 Trend: **4 → 4 → 2 → 2 → 3** genuine defects. Clean streak still **0/3** (this round found 3).
 
+## Workflow recheck round 22 (DEEP v5-ultra) — 22 confirmed (~19 unique); 18 fixed, 1 REJECTED
+
+Methodology change (ultracode): high-effort single reviewer per slice + adversarial verify +
+a **completeness critic** targeting this session's own changes, all severities, concurrency<=4,
+every agent call wrapped in try/except so a stalled API degrades gracefully (the first v5 attempt
+crashed after 3.5h/194 agents on an uncaught StructuredOutput-cap throw; the rewrite is crash-proof).
+The deeper pass surfaced far more than the shallow rounds — including several **regressions/gaps from
+my own earlier fixes**, vindicating the user's "every fix makes new errors" concern.
+
+- **REJECTED (low): recovery `_match` doesn't crop to `det.region`.** Working as designed — D9
+  deliberately classifies on the FULL frame (with an optional `mask`); cropping would change tuned
+  detector scores and risk a recovery regression. `region` on detectors is tolerated-but-unused. **No change.**
+
+Regressions/gaps from this session's own fixes:
+- **config.py (#A): `looks_like_roblox_url` threw on `http://[::1`** — my round-21 `urlparse` fix.
+  `urlparse(...).hostname` raises `ValueError('Invalid IPv6 URL')`, escaping as a raw crash from the
+  strat-header path. **Fix:** `try/except ValueError -> False`.
+- **permissions.py (#O): false "Screen Recording denied"** — my round-18 capture clamp returns a 1x1
+  sliver for an off-screen window (var==0 + dark). **Fix:** grabs smaller than 64px are inconclusive.
+- **recorder.py (#P): held *mouse buttons* dropped at stop** — my round-17 fix drained held *keys*
+  only. **Fix:** `build()` drains `coalescer._down` too (synthetic release at `info["last"]`).
+- **gui.py (#I/#S/#R):** the GUI feature skipped `config.validate()` (URL/title gates bypassed →
+  fixed: validate in start_play/start_record), lost a recording if save failed (→ fallback save to a
+  temp file), and toggled pause non-atomically (→ shared `HotkeyEvents.toggle_pause()` under a lock).
+
+Pre-existing, fixed:
+- **window.py (#L, high): AppleScript injection** via `window_title_match` (settable from an
+  untrusted strat's `config_overrides`) interpolated into an `osascript` program. **Fix:** escape the
+  AppleScript string literal in `activate()` + reject quotes/backslashes/newlines in `validate()`.
+- **recovery.py (#J, high): `FOCUS_LOST` STOPped on the first unconfirmed `activate()`** — but
+  `osascript activate` is async, so a transient blip permanently halted the bot without using the
+  budget. **Fix:** a bounded settle-recheck loop before STOP.
+- **engine.py (#H, med): `session_max_minutes` was never enforced** (documented anti-detection cap).
+  **Fix:** enforce it between iterations.
+- **config.py (#B, med):** `relaunch_url` wasn't URL-validated like `private_server_url`. **Fix:** mirror.
+- **strat.py (#E/#F):** `clicks` unbounded (click storm) and `stability_frames` accepted negatives
+  (debounce/min-timeout collapse). **Fix:** bound `clicks` 1..20, require `stability_frames >= 1`
+  (+ `max(1, …)` clamp in `_adaptive_wait`).
+- **strat.py/engine.py (#G):** per-event `jitter_ms` round-tripped but never applied. **Fix:**
+  `_play_sequence` honors `e.jitter_ms`; `expand_all` propagates it to a macro's primitives.
+- **config.py (#C):** an int field silently accepted a bool override (`True`->1). **Fix:** reject it.
+- **pngio.py (#D):** a bad IHDR length raised `struct.error` not `ValueError`. **Fix:** length check.
+- **input_backend.py (#M):** `release_key` released a shared modifier still held by another key.
+  **Fix:** refcount held keys (`_hold`/`_unhold`); OS-release only at count 0.
+- **hotkeys.py (#N):** a kill-switch path that is a directory instant-panicked every run. **Fix:** `isfile`.
+- **cli.py (#Q):** `cmd_record`'s `save()` was outside try/except (an OSError lost the recording +
+  dumped a trace). **Fix:** wrap, report cleanly.
+
+Tests: +23 (`tests/test_bugfixes_recheck20.py`); 3 pre-existing tests updated for changed internals
+(refcount dict, full-size denial frame) → **313 pass, ruff + pyflakes clean**.
+Trend: **4 → 2 → 2 → 3 → 18** genuine defects (the spike is the deeper methodology, not new churn).
+Clean streak **0/3**.
+
+## Workflow recheck round 22b (DEEP v5-ultra, 2nd pass) — 10 confirmed, all fixed
+
+Count dropped 18 -> 10 under the SAME v5 depth (the previous spike was the deeper instrument
+clearing a backlog, not new churn). The `visual` slice hit a mid-stream drop but recovered on retry
+(crash-proof design held). Again three were my-own-fix gaps (#6, #7, #8).
+
+- **strat.py (#1, low):** `run_end.timeout_ms` had no `>= 0` floor; a negative made `_wait_run_end`'s
+  deadline already-past -> every run spuriously timed out to STUCK_SYNC. **Fix:** reject `< 0` at parse.
+- **strat.py (#2, med):** the `expect_` label prefix (auto-verify syncs) wasn't reserved, so a user
+  sync labeled `expect_*` was misrouted to OUT_OF_CASH instead of `recovery.classify()`. **Fix:**
+  reject user labels starting with `expect_` (covers both prefix heuristics at engine.py:226/:369).
+- **strat.py (#3, low):** `int(1e300)` passed `_num` -> a huge `t_ms` hung `sleep_until` forever.
+  **Fix:** `_MAX_NUM = 10**12` ceiling in `_num`.
+- **strat.py/engine/input_backend (#4, low):** `easing` round-tripped but was never validated or
+  applied (dead/misleading field). **Fix:** validate against `EASINGS`, implement `_ease()`
+  (linear/ease_in/ease_out/ease_in_out) and thread it through `move()`. `linear` is the identity, so
+  every existing recording moves byte-identically (zero regression).
+- **input_backend.py (#5, low):** `_lerp_steps` was unbounded -> the mock backend could busy-spin on
+  a huge `duration_ms`. **Fix:** cap at `_MAX_LERP_STEPS = 10000` (fixes both backends).
+- **hotkeys.py (#6, low):** *my round-21 fix's* `except ImportError` (quiet) preceded `except
+  Exception` (warn) in one try, so a build-time `ImportError` (pynput's deferred backend) was
+  silently swallowed, re-defeating the visibility fix. **Fix:** split the import (quiet ImportError)
+  from the listener build (warn on any Exception).
+- **input_backend.py/recorder.py (#7, low):** `stop_listeners()` didn't join the listener threads,
+  so an in-flight callback could append an unpaired event after `build()`'s drain. **Fix:**
+  `lst.stop(); lst.join(timeout=1.0)`; corrected the recorder.build comment (the null-callback claim
+  was true only for the mock).
+- **cli.py (#8, med):** `cmd_record` never validated config, so a bad `--private-server` recorded a
+  session that `load()` later refused (lost work). **Fix:** `config.validate()` BEFORE recording.
+- **cli.py (#9, low):** `_check_consent` swallowed a consent-file write failure -> every future run
+  silently re-prompted + exited 2. **Fix:** `ui.warn` on the failure.
+- **gui.py (#10, low):** if `thread.start()` raised (thread exhaustion), `_activity` stayed
+  "play"/"record" forever (the worker's `finally` never ran). **Fix:** `_spawn()` resets to idle on
+  a failed start.
+
+Tests: +12 (`tests/test_bugfixes_recheck21.py`) -> **325 pass, ruff + pyflakes clean**.
+Trend: **2 → 2 → 3 → 18 → 10** genuine defects. Clean streak **0/3**. Session total: 48 fixed.
+
+## Workflow recheck round 22c (DEEP v5-ultra, 3rd pass) — 20 confirmed, all fixed
+
+Count rose 10 -> 20: NOT a regression but the **long tail of hand-edited-JSON input validation** —
+the adversarial review explores a different subset of ~30 fields each run, so the count is variance-y
+rather than monotonic. Most are LOW (require deliberately malformed JSON). Fixed the *class* where
+possible. Three again refined my own fixes (#1, #14/#15, #7).
+
+High/medium:
+- **window.py (#14, high):** on a real Mac, `--window-rect` returned a `MockWindowProvider` whose
+  `is_frontmost()` is always True + `activate()` is a no-op, so the engine injected clicks while
+  Roblox was backgrounded and recovery never refocused. **Fix:** `_GeometryOverrideProvider` pins
+  geometry but delegates focus to the real `QuartzWindowProvider`; Mock only for the MOCK backend.
+- **config.py (#1, med):** the float branch of `_coerce_type` didn't reject bool (round-22 #C did it
+  for int), so `{"sync_default_threshold": true}` -> 1.0 -> every sync times out. **Fix:** reject bool.
+- **strat.py (#12, med):** `sync_point` in `leave_reset_sequence` is silently dropped by
+  `recovery._run_sequence` (no branch) -> blind clicks. **Fix:** reject it at parse.
+- **engine.py (#19, med):** `cmd_calibrate` ignored `config_overrides`, so calibrate scored against a
+  different config than play. **Fix:** build config with overrides (mirror cmd_play).
+- **cli.py (#20, med):** Ctrl-C during `record` discarded the session (KeyboardInterrupt is not
+  Exception). **Fix:** `recorder.run` catches it and still builds/saves.
+- **hotkeys.py (#15, med):** a non-ImportError pynput import failure propagated before the kill-switch
+  armed (refines round-22b #6). **Fix:** broaden the import guard to `except Exception`.
+
+Low (validation/consistency long tail): #2 `window_rect_override` w/h>0; #3 `read_png` zlib.error ->
+ValueError; #4 negative `t_ms` (reorders); #5 non-string `key`; #6/#9/#10 `timeout_ms`>0 (sync/expect/
+run_end ==0 cases); #7 explicit per-event `jitter_ms=0` now suppresses (jitter_ms -> Optional); #8
+negative `jitter_ms`; #11 strip `relaunch_url`; #13 (=#14); #16 `capture_sync_point` honors
+`threshold=0.0`; #17 removed the inert `require_consent` knob; #18 GUI Validate exercises override
+coercion; #20-gui on_close flushes the save confirmation; #3 `_num` already had the `1e300` cap.
+
+Tests: +19 (`tests/test_bugfixes_recheck22.py`) -> **344 pass, ruff + pyflakes clean**.
+Trend: **2 → 3 → 18 → 10 → 20** genuine defects (variance-driven long tail, not new churn).
+Clean streak **0/3**. Session total: 68 fixed.
+
+## Round 22d — SYSTEMATIC validation pass (user chose "fix the class, not the instances")
+
+Rationale: rounds 22/22b/22c showed the deep review had bottomed out into the long tail of
+hand-edited-JSON input validation (18 → 10 → 20, variance-driven across ~30 fields). Rather than keep
+whacking individual fields, collapse the whole class at its single source.
+
+- **strat.py `_num` gained `lo`/`hi` (inclusive) bounds** + already-present bool rejection (via
+  `_is_num`) + the `_MAX_NUM` ceiling. Every numeric event field now passes its range through this one
+  helper, so an out-of-range hand-edited value is reported at load uniformly.
+- **Converted all `_build_event` / `_base` / `_expect` / run_end `_num` sites to pass `lo`/`hi`** and
+  **removed the ~10 ad-hoc manual range checks** added in rounds 22/22b/22c (clicks 1..20, times 1..50,
+  hotbar_slot 1..8, settle_ms/between_ms/t_ms/jitter_ms ≥ 0, sync/expect/run_end timeout ≥ 1,
+  stability_frames ≥ 1). Same behavior, one mechanism.
+- **Newly closed gaps the manual pass had missed:** `id`, `hold_ms`, `duration_ms` (wait/move/drag),
+  `poll_ms` were unbounded — now `lo`-bounded too. (`dx`/`dy` stay sign-free; magnitude bounded by
+  `_MAX_NUM`.) `threshold` keeps its dedicated `_threshold` helper (already [0,1]-bounded).
+
+Behavior note: an out-of-range value now falls back to the field default (was: clamp); since `parse()`
+raises `StratValidationError` on any problem, the returned value is never consumed, so no runtime
+difference. The example strat still validates; one round-6 test's exact-message assertion ("1..50")
+updated to the new `_num` format.
+
+Tests: +7 (`tests/test_bugfixes_recheck23.py`, incl. a valid-boundary-values acceptance test) →
+**351 pass, ruff + pyflakes clean**. Next review should find this whole class collapsed.
+
+## Workflow recheck round 23 (post-systematic-pass) — 10 confirmed; 9 fixed, 1 REJECTED
+
+The systematic pass worked: count 20 -> 10 and only ONE of the 10 was the validation class (scroll
+dx/dy, which I'd left sign-free). The other 9 were diverse engine/recovery/permission edge cases —
+including a real HIGH. Three again refined my own fixes (#7 round-22 refcount, #9 round-18/22
+permission, #10/#2 the GUI/leave_reset validation gaps).
+
+- **REJECTED (low): `_wait_run_end` focus-loss deadline-extension cap.** The cumulative one-timeout_ms
+  cap can be exhausted by a long early focus loss, after which a late victory could be missed -> a
+  *bounded, safe* spurious rejoin. It's a deliberate anti-hang trade-off (recheck #w-flap), the trigger
+  needs aggregate focus-loss > run_end.timeout_ms (~10 min), and the alternative (always-extend +
+  cap event count) risks re-introducing the hang. **No change** (documented).
+- **permissions.py (#9, HIGH):** the denial heuristic averaged all 4 BGRA channels, but a real macOS
+  denied frame is RGB(0,0,0) but OPAQUE (alpha=255) -> mean 63.75 -> never "denied" (false GRANTED);
+  my earlier tests used alpha=0 zeros, masking it. **Fix:** strip alpha (`arr[:,:,:3]`) before the
+  heuristic; new alpha=255 regression test.
+- **engine.py (#3, med):** a stuck sync that reclassified to VICTORY/DEFEAT was routed through
+  `_route_recovery` -> `_RestartLoop`, counted as a restart (burning the budget), never a win/loss.
+  **Fix:** new `_RunComplete` signal -> the loop credits it as a completed win/loss.
+- **strat.py/recovery.py (#2/#5, med):** the round-22c leave_reset `sync_point` guard missed the
+  macro->sync path (a place_tower/upgrade with `expect` expands to a sync that `_run_sequence` drops).
+  **Fix:** parse rejects any leave_reset event that `expand_macro`s to a sync_point; `_run_sequence`
+  gained an `else` that warns instead of silently dropping.
+- **input_backend.py (#7, med):** `release_key` (round-22 refcount) untracked a key BEFORE the OS
+  release, so a release that raised left it stuck (lost to `release_all`). **Fix:** release the last
+  holder, untrack only AFTER a successful release; a raising release stays tracked for recovery.
+- **strat.py (#1, low):** scroll `dx`/`dy` unbounded (the one validation straggler). **Fix:** lo/hi
+  ±10000 (sign preserved). **(#8, low):** `hold_ms` uncapped -> an uninterruptible multi-minute click
+  hold could block panic. **Fix:** `hi=2000`. **(#6, low):** missing `lobby_anchor` with other
+  detectors STOP-bounds recovery -> **Fix:** parse warns.
+- **gui.py (#10, low):** Validate didn't vet the typed private-server link (Play did) -> false green
+  light. **Fix:** `validate()` takes `private_server` and builds the same config Play does.
+
+Tests: +8 (`tests/test_bugfixes_recheck24.py`) -> **359 pass, ruff + pyflakes clean**.
+Trend: **18 → 10 → 20 → (systematic pass) → 10** genuine. Validation class collapsed; remaining tail
+is diverse engine/recovery. Session total: 77 fixed.
+
+## Workflow recheck round 24 (post-systematic) — 16 raised; concluding batch: 6 fixed, rest deferred
+
+This round confirmed the loop is NOT converging to a clean streak (10 -> 16) and that fixes spawn
+follow-ons: THREE findings were follow-ons from my own recent fixes (#4/#5 from round-23 `_RunComplete`,
+#13 the flip-side of round-23's permission fix). Per the user's option-2 plan ("systematic pass ->
+confirm -> call it done"), this is the stopping point. Fixed everything I introduced/own + clean wins
++ the one durable design fix; deferred the genuine-but-involved/edge tail (listed below) for the user.
+
+Fixed:
+- **gui.py (#16, HIGH, my GUI bug):** `run_gui(config)` ignored the config the `gui` CLI command
+  built (always fresh defaults) -> `gui --mock/--private-server/--window-rect` silently dropped.
+  **Fix:** `_build_config_from(base)` bound into GuiDeps so the CLI config is honored.
+- **engine.py (#4/#5, my round-23 `_RunComplete` regressions):** it could credit a phantom run from a
+  stale end-screen during LOBBY/join (now gated on `IN_MATCH`), and didn't `release_all()` on the
+  abandoned mid-sequence path (now does).
+- **strat.py (#2, med):** `modifiers` list elements weren't type-checked -> a non-str crashed
+  `key_to_pynput` at playback (could strand a held modifier). **Fix:** reject non-str elements.
+- **config.py (#8, med, security):** `https://evil.com\@roblox.com` parsed as host roblox.com here but
+  opens evil.com in the browser (WHATWG `\`->`/`). **Fix:** reject backslashes in http(s) URLs.
+- **permissions.py (#13, med, durable):** a denied capture and a legit all-black loading screen are
+  pixel-identical, so the variance heuristic oscillates (false-grant #9 vs false-deny #13). **Fix:**
+  use the authoritative `Quartz.CGPreflightScreenCaptureAccess` on macOS 10.15+, heuristic only as
+  fallback. Resolves the #9/#13 tension permanently.
+
+DEFERRED (genuine but diminishing-returns; presented to the user to choose):
+- med: #6 `_wait_run_end` poll-gap victory counted as a restart (same class as #3, narrow timing);
+  #9 recovery `_run_sequence` move/drag not abort-aware (needs should_abort plumbing into
+  RecoveryController); #11 `_dhash`/`_phash` flat-frame false-match (only the non-default phash method).
+- low: #1 `read_png` unknown filter byte treated as 0; #3 `events: {}` swallowed by `or []`;
+  #10 FOCUS_LOST `activate()` no dry_run guard; #12 drag finally release/discard ordering (likely WAI);
+  #14 `ctrl++` combo split; #15 mark-sync not gated by record-pause.
+
+Tests: +6 (`tests/test_bugfixes_recheck25.py`) -> **365 pass, ruff + pyflakes clean**.
+Session total: ~83 genuine defects fixed + the systematic validation pass.
+
+### Why the loop is being concluded here (honest assessment)
+Defect counts across the deep (v5) rounds: **18 → 10 → 20 → (systematic pass) → 10 → 16**. The count
+oscillates rather than trending to zero because (a) the adversarial review explores a different subset
+of the codebase each run, and (b) substantive fixes add machinery with its own edge cases. The
+validation CLASS is collapsed; remaining findings are diverse, mostly low/edge-case (hand-edited JSON,
+rare timing) or fundamentally ambiguous. "3 clean rounds in a row" is not a reachable target with
+adversarial review at this depth; the macro is robust for its real (record->play) use.
+
 ## Note: workflow API failures (investigated 2026-06-24)
 Symptoms: `Connection closed mid-response`, `Stream idle timeout`, `StructuredOutput
 retry cap (5) exceeded`. Root cause: transient mid-stream drops on long agent

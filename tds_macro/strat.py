@@ -16,6 +16,7 @@ Schema extras vs a naive macro: ``join_sequence`` (M14), ``run_end`` (M15),
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import struct
@@ -27,11 +28,14 @@ from .config import MatchMethod, looks_like_roblox_url
 from .errors import StratValidationError
 from .geometry import Point, Rect
 
+log = logging.getLogger("tds_macro.strat")
+
 SCHEMA_VERSION = 1
 
 ON_TIMEOUT = {"abort", "continue", "retry", "recover"}
 RECOVERY_ACTIONS = {"leave_and_restart", "reconnect_and_rejoin", "reset_and_rejoin", "stop"}
 BUTTONS = {"left", "right", "middle"}
+EASINGS = {"linear", "ease_in", "ease_out", "ease_in_out"}  # implemented in input_backend._ease
 
 # coord tolerance: recorded points may sit a hair outside the window
 _CMIN, _CMAX = -0.05, 1.05
@@ -84,13 +88,17 @@ def _coord(v, name: str, ctx: str, problems: list) -> float:
     return f
 
 
-def _num(v, default, name: str, ctx: str, problems: list, cast=float):
+_MAX_NUM = 10 ** 12  # sane ceiling for any event field (ms/counts): ~31 years of ms; rejects 1e300
+
+
+def _num(v, default, name: str, ctx: str, problems: list, cast=float, lo=None, hi=None):
     """Guarded numeric coercion for JSON values.
 
     Missing/empty -> default (None default stays None, for optional fields).
-    Present-but-non-numeric -> append a problem and fall back to default, so a
-    typo in a hand-edited file is reported by validation instead of raising a
-    raw ValueError mid-parse (plan M12/R24).
+    Present-but-non-numeric (incl. bool, via _is_num) -> append a problem and fall back to default.
+    ``lo``/``hi`` (inclusive) bound the value: every numeric event field passes its range here so a
+    hand-edited absurd value is reported at load instead of misbehaving at playback (one source of
+    truth — round 22d systematic pass). Out-of-range falls back to the default like other rejects.
     """
     if v is None or v == "":
         return None if default is None else cast(default)
@@ -106,10 +114,20 @@ def _num(v, default, name: str, ctx: str, problems: list, cast=float):
         problems.append(f"{ctx}: '{name}' must be a whole number, got {v}")
         return None if default is None else cast(default)
     try:
-        return cast(v)  # float() of a huge Python int overflows
+        result = cast(v)  # float() of a huge Python int overflows
     except OverflowError:
         problems.append(f"{ctx}: '{name}' is too large")
         return None if default is None else cast(default)
+    if abs(result) > _MAX_NUM:  # int(1e300) succeeds -> a huge t_ms would hang sleep_until forever (round 22b #3)
+        problems.append(f"{ctx}: '{name}'={v} is out of range")
+        return None if default is None else cast(default)
+    if lo is not None and result < lo:
+        problems.append(f"{ctx}: '{name}'={result} must be >= {lo}")
+        return None if default is None else cast(default)
+    if hi is not None and result > hi:
+        problems.append(f"{ctx}: '{name}'={result} must be <= {hi}")
+        return None if default is None else cast(default)
+    return result
 
 
 def _threshold(v, default, ctx: str, problems: list):
@@ -231,13 +249,13 @@ class Event:
     t_ms: int
     type: str
     comment: str = ""
-    jitter_ms: int = 0
+    jitter_ms: Optional[int] = None  # None == use config.jitter_ms; an explicit 0 suppresses it (round 22c #7)
 
     def base_dict(self) -> dict:
         d = {"id": self.id, "t_ms": self.t_ms, "type": self.type}
         if self.comment:
             d["comment"] = self.comment
-        if self.jitter_ms:
+        if self.jitter_ms is not None:  # round-trip an explicit value (incl. 0), omit when absent
             d["jitter_ms"] = self.jitter_ms
         return d
 
@@ -454,9 +472,11 @@ _BASE_KEYS = {"id", "t_ms", "type", "comment", "jitter_ms"}
 
 
 def _base(d, ctx, problems):
-    eid = _num(d.get("id"), 0, "id", ctx, problems, cast=int)
-    t = _num(d.get("t_ms"), 0, "t_ms", ctx, problems, cast=int)
-    jitter = _num(d.get("jitter_ms"), 0, "jitter_ms", ctx, problems, cast=int)
+    eid = _num(d.get("id"), 0, "id", ctx, problems, cast=int, lo=0)
+    # lo=0: a negative t_ms would reorder events in expand_all's sort (round 22c #4)
+    t = _num(d.get("t_ms"), 0, "t_ms", ctx, problems, cast=int, lo=0)
+    # None default (not 0) so an explicit jitter_ms:0 can suppress global jitter for this event (round 22c #7)
+    jitter = _num(d.get("jitter_ms"), None, "jitter_ms", ctx, problems, cast=int, lo=0)
     return eid, t, d.get("comment", ""), jitter
 
 
@@ -472,7 +492,7 @@ def _expect(d, ctx, problems) -> Optional[ExpectSpec]:
     region = _rect(e, "region", f"{ctx}.expect", problems)
     return ExpectSpec(rf, region or Rect(0, 0, 1, 1),
                       _threshold(e.get("threshold"), 0.9, f"{ctx}.expect", problems),
-                      _num(e.get("timeout_ms"), 4000, "timeout_ms", f"{ctx}.expect", problems, cast=int))
+                      _num(e.get("timeout_ms"), 4000, "timeout_ms", f"{ctx}.expect", problems, cast=int, lo=1))
 
 
 def _build_event(d: dict, ctx: str, problems: list) -> Optional[Event]:
@@ -489,21 +509,23 @@ def _build_event(d: dict, ctx: str, problems: list) -> Optional[Event]:
     if typ == "wait":
         _no_unknown(d, _BASE_KEYS | {"duration_ms", "reason"}, ctx, problems)
         return WaitEvent(eid, t, typ, comment, jitter,
-                         _num(d.get("duration_ms"), 0, "duration_ms", ctx, problems, cast=int),
+                         _num(d.get("duration_ms"), 0, "duration_ms", ctx, problems, cast=int, lo=0),
                          d.get("reason", ""))
     if typ == "mouse_move":
         _no_unknown(d, _BASE_KEYS | {"pos", "duration_ms", "easing"}, ctx, problems)
         p = _point(d, "pos", ctx, problems)
         return MouseMoveEvent(eid, t, typ, comment, jitter, p or Point(0, 0),
-                              _num(d.get("duration_ms"), 0, "duration_ms", ctx, problems, cast=int),
-                              d.get("easing", "linear"))
+                              _num(d.get("duration_ms"), 0, "duration_ms", ctx, problems, cast=int, lo=0),
+                              _enum(d.get("easing"), EASINGS, "easing", ctx, problems, default="linear"))
     if typ == "click":
         _no_unknown(d, _BASE_KEYS | {"button", "pos", "clicks", "hold_ms"}, ctx, problems)
         p = _point(d, "pos", ctx, problems, required=False)
         return ClickEvent(eid, t, typ, comment, jitter,
                           _enum(d.get("button"), BUTTONS, "button", ctx, problems, default="left"), p,
-                          _num(d.get("clicks"), 1, "clicks", ctx, problems, cast=int),
-                          _num(d.get("hold_ms"), 0, "hold_ms", ctx, problems, cast=int))
+                          _num(d.get("clicks"), 1, "clicks", ctx, problems, cast=int, lo=1, hi=20),
+                          # cap the hold so a hand-edited huge hold_ms can't block panic during the
+                          # uninterruptible click hold for minutes (round 23 #8)
+                          _num(d.get("hold_ms"), 0, "hold_ms", ctx, problems, cast=int, lo=0, hi=2000))
     if typ == "drag":
         _no_unknown(d, _BASE_KEYS | {"button", "from", "to", "duration_ms"}, ctx, problems)
         frm = _point(d, "from", ctx, problems)
@@ -511,22 +533,26 @@ def _build_event(d: dict, ctx: str, problems: list) -> Optional[Event]:
         return DragEvent(eid, t, typ, comment, jitter,
                          _enum(d.get("button"), BUTTONS, "button", ctx, problems, default="left"),
                          frm or Point(0, 0), to or Point(0, 0),
-                         _num(d.get("duration_ms"), 300, "duration_ms", ctx, problems, cast=int))
+                         _num(d.get("duration_ms"), 300, "duration_ms", ctx, problems, cast=int, lo=0))
     if typ in ("key_press", "key_release"):
         _no_unknown(d, _BASE_KEYS | {"key", "modifiers"}, ctx, problems)
-        _req(d, "key", ctx, problems)
-        mods = d.get("modifiers", []) or []
+        key = _req_str(d, "key", ctx, problems)  # type-check like ref_frame; a list/dict key would
+        mods = d.get("modifiers", []) or []      # stringify to junk and silently drop at playback (round 22c #5)
         if not isinstance(mods, list):
             problems.append(f"{ctx}: 'modifiers' must be a list")
             mods = []
+        elif any(not isinstance(m, str) for m in mods):
+            # a non-str modifier (e.g. 123) crashes key_to_pynput(123).startswith at playback (round 23 #2)
+            problems.append(f"{ctx}: 'modifiers' must be a list of strings")
+            mods = [m for m in mods if isinstance(m, str)]
         cls = KeyPressEvent if typ == "key_press" else KeyReleaseEvent
-        return cls(eid, t, typ, comment, jitter, str(d.get("key", "")), list(mods))
+        return cls(eid, t, typ, comment, jitter, key, list(mods))
     if typ == "scroll":
         _no_unknown(d, _BASE_KEYS | {"pos", "dx", "dy"}, ctx, problems)
         p = _point(d, "pos", ctx, problems, required=False)
-        return ScrollEvent(eid, t, typ, comment, jitter, p,
-                           _num(d.get("dx"), 0, "dx", ctx, problems, cast=int),
-                           _num(d.get("dy"), 0, "dy", ctx, problems, cast=int))
+        return ScrollEvent(eid, t, typ, comment, jitter, p,  # sane caps; deltas may be negative (round 23 #1)
+                           _num(d.get("dx"), 0, "dx", ctx, problems, cast=int, lo=-10000, hi=10000),
+                           _num(d.get("dy"), 0, "dy", ctx, problems, cast=int, lo=-10000, hi=10000))
     if typ == "sync_point":
         _no_unknown(d, _BASE_KEYS | {"label", "ref_frame", "region", "threshold", "timeout_ms",
                                      "on_timeout", "match", "poll_ms", "stability_frames",
@@ -540,25 +566,26 @@ def _build_event(d: dict, ctx: str, problems: list) -> Optional[Event]:
                 match = MatchMethod(d["match"])
             except ValueError:
                 problems.append(f"{ctx}: 'match'={d['match']!r} is not a known method")
-        return SyncPointEvent(eid, t, typ, comment, jitter, d.get("label", ""), rf,
+        label = d.get("label", "")
+        if isinstance(label, str) and label.startswith("expect_"):
+            # 'expect_' is reserved for auto-generated action-verify syncs; the engine routes a
+            # timeout on those to OUT_OF_CASH, so a user label like 'expect_boss' would be
+            # misclassified instead of going through recovery.classify() (round 22b #2)
+            problems.append(f"{ctx}: 'label' must not start with the reserved prefix 'expect_'")
+        return SyncPointEvent(eid, t, typ, comment, jitter, label, rf,
                               region or Rect(0, 0, 1, 1),
                               _threshold(d.get("threshold"), None, ctx, problems),
-                              _num(d.get("timeout_ms"), None, "timeout_ms", ctx, problems, cast=int),
+                              _num(d.get("timeout_ms"), None, "timeout_ms", ctx, problems, cast=int, lo=1),
                               on_to, match,
-                              _num(d.get("poll_ms"), None, "poll_ms", ctx, problems, cast=int),
-                              _num(d.get("stability_frames"), None, "stability_frames", ctx, problems, cast=int),
+                              _num(d.get("poll_ms"), None, "poll_ms", ctx, problems, cast=int, lo=1),
+                              _num(d.get("stability_frames"), None, "stability_frames", ctx, problems, cast=int, lo=1),
                               _mask(d, ctx, problems),
                               _bool(d.get("require_settled"), False, "require_settled", ctx, problems))
     if typ == "place_tower":
         _no_unknown(d, _BASE_KEYS | {"tower", "hotbar_slot", "pos", "settle_ms", "confirm_click", "expect"}, ctx, problems)
         p = _point(d, "pos", ctx, problems)
-        slot = _num(d.get("hotbar_slot"), 1, "hotbar_slot", ctx, problems, cast=int)
-        if not (1 <= slot <= 8):
-            problems.append(f"{ctx}: 'hotbar_slot'={slot} must be 1..8")
-        settle = _num(d.get("settle_ms"), 250, "settle_ms", ctx, problems, cast=int)
-        if settle < 0:
-            problems.append(f"{ctx}: 'settle_ms'={settle} must be >= 0")
-            settle = 0
+        slot = _num(d.get("hotbar_slot"), 1, "hotbar_slot", ctx, problems, cast=int, lo=1, hi=8)
+        settle = _num(d.get("settle_ms"), 250, "settle_ms", ctx, problems, cast=int, lo=0)
         return PlaceTowerEvent(eid, t, typ, comment, jitter, d.get("tower", ""), slot, p or Point(0, 0),
                                settle, _bool(d.get("confirm_click"), True, "confirm_click", ctx, problems),
                                _expect(d, ctx, problems))
@@ -566,14 +593,8 @@ def _build_event(d: dict, ctx: str, problems: list) -> Optional[Event]:
         _no_unknown(d, _BASE_KEYS | {"target_pos", "upgrade_button_pos", "times", "between_ms", "expect"}, ctx, problems)
         tp = _point(d, "target_pos", ctx, problems)
         up = _point(d, "upgrade_button_pos", ctx, problems)
-        times = _num(d.get("times"), 1, "times", ctx, problems, cast=int)
-        if not (1 <= times <= 50):  # bound so expand_macro can't emit a runaway click storm
-            problems.append(f"{ctx}: 'times'={times} must be 1..50")
-            times = max(1, min(times, 50))
-        between = _num(d.get("between_ms"), 300, "between_ms", ctx, problems, cast=int)
-        if between < 0:  # negative would reorder the expanded upgrade clicks in time
-            problems.append(f"{ctx}: 'between_ms'={between} must be >= 0")
-            between = 0
+        times = _num(d.get("times"), 1, "times", ctx, problems, cast=int, lo=1, hi=50)
+        between = _num(d.get("between_ms"), 300, "between_ms", ctx, problems, cast=int, lo=0)
         return UpgradeEvent(eid, t, typ, comment, jitter, tp or Point(0, 0), up or Point(0, 0),
                             times, between, _expect(d, ctx, problems))
     if typ == "ability":
@@ -802,6 +823,14 @@ def parse(data: dict, base_dir: str = "", check_frames: bool = True) -> StratFil
     events = _events("events")
     join_sequence = _events("join_sequence")
     leave_reset_sequence = _events("leave_reset_sequence")
+    # recovery._run_sequence has no SyncPointEvent branch, so a sync_point here would be silently
+    # dropped (its visual wait skipped) and later menu clicks fire blind (round 22c #12). Also covers
+    # the macro->sync path: a place_tower/upgrade with an `expect` block expands to a sync (round 23 #2).
+    for i, ev in enumerate(leave_reset_sequence):
+        if any(p.type == "sync_point" for p in expand_macro(ev)):
+            problems.append(f"leave_reset_sequence[{i}]: a sync_point (or a macro with 'expect') is not "
+                            "supported here (recovery replays this sequence on a fixed timer, not the "
+                            "visual engine)")
 
     rec = data.get("recovery")
     if rec is not None and not isinstance(rec, dict):
@@ -814,6 +843,12 @@ def parse(data: dict, base_dir: str = "", check_frames: bool = True) -> StratFil
         _detector(rec_raw.get("disconnect"), "disconnect", "recovery", problems),
         _detector(rec_raw.get("lobby_anchor"), "lobby_anchor", "recovery", problems),
     )
+    if (recovery.disconnect or recovery.wrong_map) and recovery.lobby_anchor is None:
+        # without a lobby_anchor, recovery can't visually CONFIRM it reached the hub, so the
+        # per-cause budget climbs to STOP even on a successful reconnect/reset (R17). Warn (not a
+        # hard error — omitting it is allowed, just STOP-bounded) (round 23 #6).
+        log.warning("recovery has a disconnect/wrong_map detector but no lobby_anchor; recovery "
+                    "cannot confirm success and will STOP after max_attempts_per_cause attempts")
     # M17: disconnect action should reconnect, never reset_character
     if recovery.disconnect and recovery.disconnect.action == "reset_and_rejoin":
         problems.append("recovery.disconnect.action should be 'reconnect_and_rejoin' (no character "
@@ -828,10 +863,14 @@ def parse(data: dict, base_dir: str = "", check_frames: bool = True) -> StratFil
             problems.append("run_end must be an object")
         else:
             _no_unknown(re, {"victory", "defeat", "timeout_ms"}, "run_end", problems)
+            # lo=1: a <=0 deadline makes _wait_run_end return immediately -> spurious STUCK_SYNC every
+            # run (negative round 22b #1; ==0 round 22c #9). A None fallback would crash now+None, so
+            # keep the 600000 default on reject.
+            to = _num(re.get("timeout_ms"), 600000, "timeout_ms", "run_end", problems, cast=int, lo=1)
             run_end = RunEnd(
                 _detector(re.get("victory"), "victory", "run_end", problems),
                 _detector(re.get("defeat"), "defeat", "run_end", problems),
-                _num(re.get("timeout_ms"), 600000, "timeout_ms", "run_end", problems, cast=int),
+                to,
             )
 
     co = data.get("config_overrides")
@@ -949,6 +988,11 @@ def expand_macro(ev: Event) -> list[Event]:
 def expand_all(events: list[Event]) -> list[Event]:
     out: list[Event] = []
     for ev in events:
-        out.extend(expand_macro(ev))
+        prims = expand_macro(ev)
+        if ev.jitter_ms is not None:  # a macro's per-event jitter (incl. explicit 0) must reach its
+            for p in prims:  # expanded primitives, else it round-trips with zero effect (round 22 #G / 22c #7)
+                if p is not ev:  # primitive passthrough already carries its own jitter_ms
+                    p.jitter_ms = ev.jitter_ms
+        out.extend(prims)
     out.sort(key=lambda e: e.t_ms)
     return out

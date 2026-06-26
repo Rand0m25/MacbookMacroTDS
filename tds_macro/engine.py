@@ -75,6 +75,15 @@ class _StopRun(Exception):
     """Internal: halt the whole run (recovery exhausted / fatal)."""
 
 
+class _RunComplete(Exception):
+    """Internal: a stuck sync reclassified to VICTORY/DEFEAT -> the match actually finished; the loop
+    must credit it as a win/loss completed run, NOT a restart (round 23 #3). Carries the mode."""
+
+    def __init__(self, mode):
+        super().__init__(mode.value)
+        self.mode = mode
+
+
 def _default_ref_loader(path: str) -> Frame:
     from .visual import load_reference
 
@@ -172,7 +181,7 @@ class Player:
         sa = self._should_abort
         if isinstance(e, MouseMoveEvent):
             px, py = self._logical(e.pos)
-            self.input.move(px, py, e.duration_ms, self.config.mouse_move_hz, self.clock, sa)
+            self.input.move(px, py, e.duration_ms, self.config.mouse_move_hz, self.clock, sa, e.easing)
         elif isinstance(e, ClickEvent):
             if e.pos is not None:
                 px, py = self._logical(e.pos)
@@ -204,7 +213,7 @@ class Player:
         threshold = sync.threshold if sync.threshold is not None else cfg.sync_default_threshold
         method = sync.match or cfg.sync_match_method
         poll = max(1, sync.poll_ms or cfg.sync_poll_ms)  # never 0 -> no busy-spin (R6 belt-and-suspenders)
-        stability = sync.stability_frames or cfg.sync_stability_frames
+        stability = max(1, sync.stability_frames or cfg.sync_stability_frames)  # negative would bypass debounce (round 22 #F)
         timeout = sync.timeout_ms or cfg.sync_default_timeout_ms
         # M2: never let the stability window outlast the timeout (warn, don't silently bump).
         min_timeout = (stability + 1) * poll + cfg.sync_timeout_slack_ms
@@ -325,9 +334,8 @@ class Player:
         for e in prims:
             self._abort_check()
             self._maybe_pause()
-            jitter = 0
-            if self.config.jitter_ms:
-                jitter = self._rng.uniform(-self.config.jitter_ms, self.config.jitter_ms)
+            jit = e.jitter_ms if e.jitter_ms is not None else self.config.jitter_ms  # explicit 0 suppresses (round 22c #7)
+            jitter = self._rng.uniform(-jit, jit) if jit else 0
             target = self._iter_t0 + e.t_ms + self.clock_offset + jitter
             if prev_target is not None and target < prev_target:
                 # jitter must not pull an event before the previous one: a negative draw could
@@ -374,6 +382,12 @@ class Player:
             self._refresh_geo()
             full = self.capture.grab_window(self._geo)  # classify on the FULL frame (D9), not the ROI
             fm = self.recovery.classify(full)
+            if fm in (FailureMode.VICTORY, FailureMode.DEFEAT) and self.state == RunState.IN_MATCH:
+                # the match actually ended (win/loss screen is up) -> credit it as a completed run,
+                # don't route through recovery/_RestartLoop and burn the restart budget (round 23 #3).
+                # Gate on IN_MATCH so a stale end-screen during LOBBY/join nav doesn't credit a
+                # phantom run with zero gameplay (round 23 #4/#7).
+                raise _RunComplete(fm)
             if fm == FailureMode.NONE:
                 fm = FailureMode.STUCK_SYNC
         self._route_recovery(fm)
@@ -497,6 +511,7 @@ class Player:
         try:
             self._arm()
             loop_count = self.config.loop_count
+            session_start = self.clock.now_ms()  # for the session_max_minutes cap (round 22 #H)
             consecutive_restarts = 0
             while True:
                 self._abort_check()  # panic/stop always interrupts the loop (D-r3)
@@ -533,6 +548,21 @@ class Player:
                     self.stats.runs += 1
                     consecutive_restarts = 0  # a run actually completed
                     completed = True
+                except _RunComplete as rc:
+                    # a stuck sync that was really the win/loss screen: count it like the normal
+                    # _wait_run_end VICTORY/DEFEAT branch, not as a restart (round 23 #3)
+                    try:
+                        self.input.release_all()  # the abandoned mid-sequence sync may hold input (round 23 #5)
+                    except Exception:
+                        pass
+                    self.state = RunState.POSTMATCH
+                    if rc.mode == FailureMode.VICTORY:
+                        self.stats.wins += 1
+                    else:
+                        self.stats.losses += 1
+                    self.stats.runs += 1
+                    consecutive_restarts = 0
+                    completed = True
                 except _RestartLoop as r:
                     log.info("restarting loop after: %s", r)
                     self.stats.restarts += 1  # NOT a completed run (R6: don't satisfy loop_count)
@@ -549,6 +579,12 @@ class Player:
 
                 if loop_count and self.stats.runs >= loop_count:
                     self.stats.stopped_reason = "loop_count reached"
+                    break
+                if (self.config.session_max_minutes > 0 and self.clock.now_ms() - session_start
+                        >= self.config.session_max_minutes * 60_000):
+                    # documented anti-detection/session cap (was never enforced) — checked between
+                    # iterations, so it can't interrupt an in-progress match (round 22 #H)
+                    self.stats.stopped_reason = "session cap reached"
                     break
                 if completed:  # only break between COMPLETED runs, not restart attempts (recheck #w-break)
                     self._maybe_break_between_runs()

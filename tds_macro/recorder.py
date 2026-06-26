@@ -260,8 +260,9 @@ class Recorder:
         abspath = os.path.join(self._strat_dir, rel)
         data, w, h = frame_to_rgba_bytes(frame)
         write_png(abspath, data, w, h, 4)
+        thr = threshold if threshold is not None else self.config.sync_default_threshold  # 0.0 is valid (round 22c #16)
         sp = SyncPointEvent(0, self._now_ms(), "sync_point", label=label, ref_frame=rel,
-                            region=region, threshold=threshold or self.config.sync_default_threshold,
+                            region=region, threshold=thr,
                             timeout_ms=self.config.sync_default_timeout_ms, on_timeout="recover")
         self.coalescer.add_sync_point(sp)
         return sp
@@ -288,18 +289,29 @@ class Recorder:
                 except Exception:        # brief minimize) must not abort an in-progress recording
                     pass
                 time.sleep(poll_s)
+        except KeyboardInterrupt:
+            # Ctrl-C = stop the recording cleanly and still build/save it, rather than discarding
+            # the whole session with an uncaught traceback (round 22c #20)
+            log.info("recording interrupted (Ctrl-C); finalizing")
         finally:
             self.input.stop_listeners()
         return self.build(strat_path, header)
 
     def build(self, strat_path: str, header: Optional[Header] = None) -> StratFile:
-        # Drain any keys still physically held when recording stopped: stop_listeners()
-        # already nulled the release callback, so their eventual physical release fires
-        # nothing. Emit synthetic releases so every recorded press is paired (D14/D15)
-        # and replay never leaves a key stuck (round 17 #3).
+        # Drain any keys still physically held when recording stopped. run() calls
+        # stop_listeners() first, which stops AND joins the listener threads (round 22b #7) so no
+        # callback fires concurrently with this drain; the mock backend also nulls its callbacks.
+        # Emit synthetic releases so every recorded press is paired (D14/D15) and replay never
+        # leaves a key stuck (round 17 #3).
         for key in list(self._pressed_keys):
             self.coalescer.on_key(key, False, self._now_ms())
         self._pressed_keys.clear()
+        # Same for a mouse button still physically held at stop: its release callback was nulled, so
+        # without a synthetic release the whole click/drag is silently dropped from the recording
+        # (round 17 #3 keyboard fix, mirrored to the mouse path — round 22 #P). info["last"] keeps
+        # the accumulated max_dist so drag-vs-click classification stays correct.
+        for button, info in list(self.coalescer._down.items()):
+            self.coalescer.on_button(info["last"], button, False, self._now_ms())
         events = self.coalescer.finish()
         geo = self._geo or self.window.get_geometry()
         hdr = header or Header()

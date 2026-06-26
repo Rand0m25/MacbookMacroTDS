@@ -46,13 +46,34 @@ def check_accessibility(prompt: bool = False) -> bool:
 
 
 def check_screen_recording(capture=None, geo=None) -> bool:
-    """Grab one frame and assert it isn't a flat/black image (variance heuristic)."""
-    if not is_macos() or capture is None or geo is None:
+    """Authoritatively ask macOS (CGPreflightScreenCaptureAccess), falling back to a variance
+    heuristic. The heuristic alone can't win: a DENIED capture and a legit all-black loading screen
+    are pixel-identical, so it oscillates between false-grant and false-deny (round 23 #13)."""
+    if not is_macos():
+        return True
+    try:
+        import Quartz  # type: ignore
+        preflight = getattr(Quartz, "CGPreflightScreenCaptureAccess", None)
+        if preflight is not None:
+            return bool(preflight())  # definitive on macOS 10.15+
+    except Exception:
+        pass  # old macOS / no Quartz -> fall back to the heuristic below
+    if capture is None or geo is None:
         return True
     try:
 
         frame = capture.grab_window(geo)
         arr = frame.as_numpy().astype("float64")
+        # Use COLOR channels only: a real macOS denied capture is RGB(0,0,0) but OPAQUE (alpha=255),
+        # so averaging all 4 BGRA channels gives mean ~63.75 and the denial heuristic never fires
+        # (false "granted"). Strip alpha to test the actual pixels (round 23 #9).
+        if arr.ndim == 3 and arr.shape[2] >= 4:
+            arr = arr[:, :, :3]
+        # An off-screen window gets clamped to a tiny (even 1x1) in-bounds sliver by the capture
+        # backend; a tiny/uniform grab has var()==0 and can be dark, which would FALSELY read as
+        # denied. Too-small to judge -> inconclusive (assume granted), not denied (round 22 #O).
+        if arr.shape[0] * arr.shape[1] < 64:
+            return True
         # macOS denial returns a perfectly flat BLACK frame. A legitimately near-uniform
         # window (dark scene, loading screen, solid-colour UI panel) still has a nonzero
         # mean, so only treat flat-AND-black as denied (avoids false negatives).

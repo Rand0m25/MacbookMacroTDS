@@ -72,7 +72,7 @@ def _button_name(button) -> str:
 
 
 class InputBackend(Protocol):
-    def move(self, px, py, duration_ms=0, hz=120, clock=None, should_abort=None): ...
+    def move(self, px, py, duration_ms=0, hz=120, clock=None, should_abort=None, easing="linear"): ...
     def click(self, button="left", px=None, py=None, clicks=1, hold_ms=25): ...
     def drag(self, button, fx, fy, tx, ty, duration_ms=300, hz=120, clock=None, should_abort=None): ...
     def press_key(self, key, modifiers=()): ...
@@ -84,8 +84,23 @@ class InputBackend(Protocol):
     def release_all(self): ...
 
 
+_MAX_LERP_STEPS = 10000  # cap so an absurd hand-edited duration_ms can't make the mock busy-spin (round 22b #5)
+
+
 def _lerp_steps(duration_ms: float, hz: int) -> int:
-    return max(1, int(round(duration_ms / 1000.0 * hz)))
+    return min(_MAX_LERP_STEPS, max(1, int(round(duration_ms / 1000.0 * hz))))
+
+
+def _ease(name: str, t: float) -> float:
+    """Map a linear progress t in [0,1] to an eased value. 'linear' is the identity, so existing
+    (linear) recordings move EXACTLY as before; other curves humanize motion (round 22b #4)."""
+    if name == "ease_in":
+        return t * t
+    if name == "ease_out":
+        return t * (2.0 - t)
+    if name == "ease_in_out":
+        return t * t * (3.0 - 2.0 * t)  # smoothstep
+    return t  # linear / unknown
 
 
 class MockInputBackend:
@@ -101,13 +116,13 @@ class MockInputBackend:
         self.on_move = self.on_click = self.on_scroll = None
         self.on_press = self.on_release = None
 
-    def move(self, px, py, duration_ms=0, hz=120, clock=None, should_abort=None):
+    def move(self, px, py, duration_ms=0, hz=120, clock=None, should_abort=None, easing="linear"):
         steps = _lerp_steps(duration_ms, hz) if duration_ms > 0 else 1
         for _ in range(steps):
             if should_abort and should_abort():
                 raise PanicAbort("panic during move")
         self._pos = (px, py)
-        self.events.append({"action": "move", "x": px, "y": py, "duration_ms": duration_ms})
+        self.events.append({"action": "move", "x": px, "y": py, "duration_ms": duration_ms, "easing": easing})
 
     def click(self, button="left", px=None, py=None, clicks=1, hold_ms=25):
         if px is not None and py is not None:
@@ -190,9 +205,23 @@ class PynputInputBackend:
         self._kb = None
         self._lock = threading.Lock()
         self._held_buttons: set[str] = set()
-        self._held_keys: set[str] = set()
+        self._held_keys: dict[str, int] = {}  # key -> refcount (a modifier shared by two held keys) (round 22 #M)
         self._mouse_listener = None
         self._kb_listener = None
+
+    def _hold(self, k: str) -> None:
+        with self._lock:
+            self._held_keys[k] = self._held_keys.get(k, 0) + 1
+
+    def _unhold(self, k: str) -> bool:
+        """Decrement k's refcount; return True iff it just dropped to 0 (was held) -> OS-release it."""
+        with self._lock:
+            n = self._held_keys.get(k, 0)
+            if n <= 1:
+                self._held_keys.pop(k, None)
+                return n >= 1
+            self._held_keys[k] = n - 1
+            return False
 
     def _ensure(self):
         if self._mouse is None:
@@ -207,7 +236,7 @@ class PynputInputBackend:
 
         return getattr(Button, name)
 
-    def move(self, px, py, duration_ms=0, hz=120, clock=None, should_abort=None):
+    def move(self, px, py, duration_ms=0, hz=120, clock=None, should_abort=None, easing="linear"):
         self._ensure()
         if duration_ms <= 0:
             self._mouse.position = (px, py)
@@ -217,7 +246,7 @@ class PynputInputBackend:
         for i in range(1, steps + 1):
             if should_abort and should_abort():
                 raise PanicAbort("panic during move")
-            t = i / steps
+            t = _ease(easing, i / steps)  # 'linear' is identity -> unchanged for existing strats (round 22b #4)
             self._mouse.position = (sx + (px - sx) * t, sy + (py - sy) * t)
             self._sleep(duration_ms / steps, clock)
 
@@ -280,29 +309,30 @@ class PynputInputBackend:
             pm = key_to_pynput(m)
             if pm is None:
                 continue
-            with self._lock:
-                self._held_keys.add(m)
+            self._hold(m)  # track (refcount) BEFORE pressing for crash-safety
             self._kb.press(pm)
         pk = key_to_pynput(key)
         if pk is None:
             return
-        with self._lock:
-            self._held_keys.add(key)
+        self._hold(key)
         self._kb.press(pk)
 
     def release_key(self, key, modifiers=()):
         self._ensure()
-        pk = key_to_pynput(key)
-        if pk is not None:
-            self._kb.release(pk)
-        for m in modifiers:
-            pm = key_to_pynput(m)
-            if pm is not None:
-                self._kb.release(pm)
-        with self._lock:
-            self._held_keys.discard(key)
-            for m in modifiers:
-                self._held_keys.discard(m)
+        # Release the main key first, then modifiers. Only OS-release a key whose refcount is about to
+        # hit 0 (a modifier still held by another key stays down) — round 22 #M. Untrack only AFTER a
+        # successful OS release, so a release that raises leaves the key tracked for release_all() to
+        # recover instead of becoming stuck input (round 23 #7).
+        for k in (key, *modifiers):
+            pk = key_to_pynput(k)
+            with self._lock:
+                last = self._held_keys.get(k, 0) <= 1
+            if pk is not None and last:
+                try:
+                    self._kb.release(pk)
+                except Exception:
+                    continue  # keep k tracked; release_all() will retry it
+            self._unhold(k)
 
     def scroll(self, dx, dy):
         self._ensure()
@@ -345,6 +375,9 @@ class PynputInputBackend:
             if lst is not None:
                 try:
                     lst.stop()
+                    # JOIN so no in-flight callback can fire after the recorder stops and drains its
+                    # held keys/buttons (else a late _on_press appends an unpaired event) (round 22b #7)
+                    lst.join(timeout=1.0)
                 except Exception:
                     pass
         self._mouse_listener = self._kb_listener = None

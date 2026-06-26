@@ -40,6 +40,24 @@ def _default_build_config(*, overrides=None, loop_count=None, dry_run=None,
     return cfg
 
 
+def _build_config_from(base):
+    """A GuiDeps.build_config bound to a given BASE config, so the `gui` CLI command's config
+    (--mock / --private-server / --window-rect / overrides) is honored instead of silently dropped
+    for a fresh default Config (round 23 #16)."""
+    def _bc(*, overrides=None, loop_count=None, dry_run=None, private_server=None, frames_dir=None):
+        cfg = base.with_overrides(overrides or {})  # with_overrides returns a fresh copy
+        if loop_count is not None:
+            cfg.loop_count = loop_count
+        if dry_run is not None:
+            cfg.dry_run = dry_run
+        if private_server:
+            cfg.private_server_url = private_server
+        if frames_dir:
+            cfg.frames_dir = frames_dir
+        return cfg
+    return _bc
+
+
 def _default_make_play_engine(st, cfg):
     from .cli import _build_backends
     from .engine import Player
@@ -136,13 +154,31 @@ class GuiController:
         with self._lock:
             return self._activity != "idle"
 
+    def _spawn(self, hk, activity_label: str) -> bool:
+        """Start hotkeys + the already-assigned worker thread. If thread.start() fails (e.g. a
+        RuntimeError under thread exhaustion), reset to idle so the controller isn't left
+        permanently 'busy' with a thread whose finally never ran (round 22b #10)."""
+        self._safe_start_hotkeys(hk)
+        try:
+            self._thread.start()
+        except Exception as e:
+            try:
+                hk.stop()
+            except Exception:
+                pass
+            with self._lock:
+                self._activity, self._player, self._hk, self._thread = "idle", None, None, None
+            self._emit("error", f"could not start: {e}")
+            return False
+        self._emit("state", activity_label)
+        return True
+
     # -- Validate button --
-    def validate(self, path: str):
+    def validate(self, path: str, private_server: str = ""):
         from .errors import StratValidationError
 
         try:
-            self.deps.load_strat(path)
-            return True, []
+            st = self.deps.load_strat(path)
         except StratValidationError as e:
             return False, list(e.problems)
         except (OSError, ValueError) as e:
@@ -150,6 +186,18 @@ class GuiController:
             # file): keep the (ok, problems) contract instead of crashing the Tk callback
             # with a traceback (round 18 #4).
             return False, [str(e)]
+        # Exercise the SAME config build Play uses — overrides coercion AND the typed private-server
+        # link — so Validate and Play agree (a bad link no longer gets a false green light) (round
+        # 22c #18 + round 23 #10).
+        try:
+            cfg = self.deps.build_config(overrides=getattr(st, "config_overrides", None),
+                                         private_server=private_server)
+        except Exception as e:
+            return False, [f"bad config_overrides: {e}"]
+        problems = cfg.validate()
+        if problems:
+            return False, problems
+        return True, []
 
     # -- Play button --
     def start_play(self, path: str, *, loop_count=0, dry_run=False,
@@ -175,6 +223,14 @@ class GuiController:
                 cfg = self.deps.build_config(overrides=getattr(st, "config_overrides", None),
                                              loop_count=loop_count, dry_run=dry_run,
                                              private_server=private_server)
+            except Exception as e:
+                self._emit("error", f"could not start: {e}")
+                return False
+            problems = cfg.validate()  # enforce the CLI's gates (URL host, window_title_match…) (round 22 #I)
+            if problems:
+                self._emit("error", "invalid config: " + "; ".join(problems))
+                return False
+            try:
                 player, hk = self.deps.make_play_engine(st, cfg)
             except Exception as e:
                 self._emit("error", f"could not start: {e}")
@@ -182,10 +238,7 @@ class GuiController:
             self._player, self._hk, self._activity = player, hk, "play"
             self._thread = threading.Thread(target=self._run, args=("play", player.run, hk),
                                             daemon=True)
-        self._safe_start_hotkeys(hk)
-        self._thread.start()
-        self._emit("state", "play")
-        return True
+        return self._spawn(hk, "play")
 
     # -- Record button --
     def start_record(self, path: str, *, name="", map="", difficulty="", private_server="") -> bool:
@@ -195,23 +248,42 @@ class GuiController:
                 return False
             try:
                 cfg = self.deps.build_config(private_server=private_server)
+            except Exception as e:
+                self._emit("error", f"could not start: {e}")
+                return False
+            problems = cfg.validate()  # validate before recording too (round 22 #I)
+            if problems:
+                self._emit("error", "invalid config: " + "; ".join(problems))
+                return False
+            try:
                 recorder, hk = self.deps.make_record_engine(cfg)
             except Exception as e:
                 self._emit("error", f"could not start: {e}")
                 return False
             header = self._make_header(name, map, difficulty)
+            save_strat = self.deps.save_strat
 
             def _do():
                 strat = recorder.run(path, header=header)
-                self.deps.save_strat(strat, path)
-                self._emit("log", f"saved {len(strat.events)} events to {path}")
+                try:
+                    save_strat(strat, path)
+                    self._emit("log", f"saved {len(strat.events)} events to {path}")
+                except Exception as e:
+                    # don't lose a just-recorded session if the typed path is unwritable: fall back
+                    # to a unique temp file and tell the user where it is (round 22 #S).
+                    import os
+                    import tempfile
+                    fd, fallback = tempfile.mkstemp(prefix="tds_recording_", suffix=".strat.json")
+                    os.close(fd)
+                    try:
+                        save_strat(strat, fallback)
+                        self._emit("error", f"could not save to {path} ({e}); saved a copy to {fallback}")
+                    except Exception as e2:
+                        self._emit("error", f"could not save the recording ({e}); fallback also failed ({e2})")
 
             self._player, self._hk, self._activity = None, hk, "record"
             self._thread = threading.Thread(target=self._run, args=("record", _do, hk), daemon=True)
-        self._safe_start_hotkeys(hk)
-        self._thread.start()
-        self._emit("state", "record")
-        return True
+        return self._spawn(hk, "record")
 
     # -- Pause/Resume button --
     def pause_toggle(self) -> bool:
@@ -219,12 +291,7 @@ class GuiController:
             hk = self._hk
         if hk is None:
             return False
-        ev = hk.events.pause
-        if ev.is_set():
-            ev.clear()
-        else:
-            ev.set()
-        return ev.is_set()
+        return hk.events.toggle_pause()  # atomic; can't race the pause hotkey (round 22 #R)
 
     # -- Stop / Panic button (and window close) --
     def stop(self) -> bool:
@@ -299,7 +366,10 @@ def run_gui(config=None) -> int:
         return 1
 
     root.title("TDS Macro")
-    ctrl = GuiController()
+    # Honor the config the `gui` CLI command built (--mock, --private-server, --window-rect, …);
+    # without this it was silently ignored and a fresh default Config used (round 23 #16).
+    deps = GuiDeps(build_config=_build_config_from(config)) if config is not None else None
+    ctrl = GuiController(deps)
     pad = {"padx": 6, "pady": 3}
 
     def log(msg):
@@ -329,7 +399,7 @@ def run_gui(config=None) -> int:
                ).grid(row=0, column=3, **pad)
 
     def do_validate():
-        ok, problems = ctrl.validate(path_var.get())
+        ok, problems = ctrl.validate(path_var.get(), private_server=link_var.get())  # vet the link too (round 23 #10)
         log("valid ✓" if ok else "invalid ✗")
         for p in problems:
             log("  - " + p)
@@ -387,7 +457,11 @@ def run_gui(config=None) -> int:
     poll()
 
     def on_close():
-        ctrl.stop()
+        ctrl.stop()  # joins the worker, so a record session is saved before we tear down
+        try:
+            root.update()  # flush the "saved N events"/"done" after-callbacks so they aren't lost (round 22c #20)
+        except Exception:
+            pass
         root.destroy()
     root.protocol("WM_DELETE_WINDOW", on_close)
     root.mainloop()
