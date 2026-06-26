@@ -806,16 +806,23 @@ Fixed:
   use the authoritative `Quartz.CGPreflightScreenCaptureAccess` on macOS 10.15+, heuristic only as
   fallback. Resolves the #9/#13 tension permanently.
 
-DEFERRED (genuine but diminishing-returns; presented to the user to choose):
-- med: #6 `_wait_run_end` poll-gap victory counted as a restart (same class as #3, narrow timing);
-  #9 recovery `_run_sequence` move/drag not abort-aware (needs should_abort plumbing into
-  RecoveryController); #11 `_dhash`/`_phash` flat-frame false-match (only the non-default phash method).
-- low: #1 `read_png` unknown filter byte treated as 0; #3 `events: {}` swallowed by `or []`;
+3 MEDIUMS — initially deferred, then FIXED at the user's request (targeted, no more full rounds):
+- **engine.py (#6):** `_wait_run_end` now does a final victory/defeat poll after the loop, so an end
+  screen that appeared in the gap between the last poll and the deadline is credited as a win/loss
+  instead of returning NONE -> spurious STUCK_SYNC restart. (Extracted `_match_run_end` helper.)
+- **recovery.py (#9):** `_run_sequence` passes `clock=self.clock` to `move`/`drag`, so their
+  interpolation sleeps raise PanicAbort on panic (RealClock) — a long recovery move is now
+  panic-interruptible instead of running to completion.
+- **visual.py (#11):** `_phash_sim` mirrors `_ncc`'s D10/D11 flat-frame rule (two uniform frames of
+  different brightness no longer match at Hamming 0; only the non-default phash method was affected).
+
+STILL DEFERRED (low edge-cases; documented, not fixed):
+- #1 `read_png` unknown filter byte treated as 0; #3 `events: {}` swallowed by `or []`;
   #10 FOCUS_LOST `activate()` no dry_run guard; #12 drag finally release/discard ordering (likely WAI);
   #14 `ctrl++` combo split; #15 mark-sync not gated by record-pause.
 
-Tests: +6 (`tests/test_bugfixes_recheck25.py`) -> **365 pass, ruff + pyflakes clean**.
-Session total: ~83 genuine defects fixed + the systematic validation pass.
+Tests: +6 (`tests/test_bugfixes_recheck25.py`) + 4 (`tests/test_bugfixes_recheck26.py`) ->
+**369 pass, ruff + pyflakes clean**. Session total: ~86 genuine defects fixed + the systematic pass.
 
 ### Why the loop is being concluded here (honest assessment)
 Defect counts across the deep (v5) rounds: **18 → 10 → 20 → (systematic pass) → 10 → 16**. The count

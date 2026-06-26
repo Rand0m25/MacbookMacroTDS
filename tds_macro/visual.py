@@ -166,6 +166,14 @@ def _dhash_bits(np, gray):
 
 
 def _phash_sim(np, a, b) -> float:
+    # dhash yields an all-False bit vector for ANY uniform frame, so two flat frames of different
+    # brightness (e.g. solid black vs solid white) would falsely match at Hamming 0. Mirror _ncc's
+    # D10/D11 flat-frame rule before hashing (round 23 #11).
+    fa, fb = float(a.std()) == 0.0, float(b.std()) == 0.0
+    if fa and fb:
+        return 1.0 if abs(float(a.mean()) - float(b.mean())) < 1.0 else 0.0
+    if fa or fb:
+        return 0.0  # exactly one is flat -> NOT a match (flat != textured)
     ba, bb = _dhash_bits(np, a), _dhash_bits(np, b)
     hamming = int((ba != bb).sum())
     return 1.0 - hamming / float(ba.size)

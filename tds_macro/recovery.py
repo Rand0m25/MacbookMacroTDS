@@ -296,7 +296,9 @@ class RecoveryController:
                 continue  # the sleep_until above already realized the delay
             elif isinstance(e, MouseMoveEvent):
                 px, py = coords.norm_to_logical(e.pos)
-                self.input.move(px, py, e.duration_ms)
+                # pass the clock so the interpolation sleeps are panic-interruptible (its sleep raises
+                # PanicAbort on abort); else a long recovery move ignores panic/stop (round 23 #9)
+                self.input.move(px, py, e.duration_ms, clock=self.clock)
             elif isinstance(e, ClickEvent):
                 if e.pos is not None:
                     px, py = coords.norm_to_logical(e.pos)
@@ -306,7 +308,7 @@ class RecoveryController:
             elif isinstance(e, DragEvent):
                 fx, fy = coords.norm_to_logical(e.frm)
                 tx, ty = coords.norm_to_logical(e.to)
-                self.input.drag(e.button, fx, fy, tx, ty, e.duration_ms)
+                self.input.drag(e.button, fx, fy, tx, ty, e.duration_ms, clock=self.clock)  # abort-aware (round 23 #9)
             elif isinstance(e, KeyPressEvent):
                 self.input.press_key(e.key, e.modifiers)
             elif isinstance(e, KeyReleaseEvent):

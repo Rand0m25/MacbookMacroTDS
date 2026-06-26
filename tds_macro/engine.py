@@ -393,6 +393,16 @@ class Player:
         self._route_recovery(fm)
 
     # --- run-end detection (M15) -----------------------------------------
+    def _match_run_end(self, window) -> Optional[FailureMode]:
+        re = self.strat.run_end
+        for det, mode in ((re.victory, FailureMode.VICTORY), (re.defeat, FailureMode.DEFEAT)):
+            if det is None:
+                continue
+            ref = self._ref(det.ref_frame, mode.value)
+            if self.comparator.score(window, ref, self.config.sync_match_method, det.mask or None) >= det.threshold:
+                return mode
+        return None
+
     def _wait_run_end(self) -> FailureMode:
         re = self.strat.run_end
         if re is None:
@@ -404,12 +414,9 @@ class Player:
             self._abort_check()
             self._refresh_geo()
             window = self.capture.grab_window(self._geo)
-            for det, mode in ((re.victory, FailureMode.VICTORY), (re.defeat, FailureMode.DEFEAT)):
-                if det is None:
-                    continue
-                ref = self._ref(det.ref_frame, mode.value)
-                if self.comparator.score(window, ref, self.config.sync_match_method, det.mask or None) >= det.threshold:
-                    return mode
+            mode = self._match_run_end(window)
+            if mode is not None:
+                return mode
             # also catch focus-loss / disconnect / kick while waiting for the end
             fm = self._detect_failure()
             if fm == FailureMode.FOCUS_LOST:
@@ -427,7 +434,12 @@ class Player:
             elif fm in (FailureMode.DISCONNECTED, FailureMode.WRONG_MAP):
                 return fm
             self.clock.sleep(max(1, self.config.recovery_check_every_ms))  # never 0 -> no hang/busy-spin
-        return FailureMode.NONE
+        # Final check: the win/loss screen may have appeared in the gap between the last poll and the
+        # deadline. Don't return NONE on a real end (that routes a genuine win/loss to spurious
+        # STUCK_SYNC recovery and counts it as a restart) (round 23 #6).
+        self._refresh_geo()
+        mode = self._match_run_end(self.capture.grab_window(self._geo))
+        return mode if mode is not None else FailureMode.NONE
 
     # --- top-level run loop ----------------------------------------------
     def _arm(self) -> None:
