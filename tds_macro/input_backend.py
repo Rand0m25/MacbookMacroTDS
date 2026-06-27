@@ -27,25 +27,50 @@ log = logging.getLogger("tds_macro.input_backend")
 def prewarm_macos_keyboard() -> None:
     """Work around a pynput-vs-macOS-15 crash (SIGSEGV) — call ONCE on the MAIN thread.
 
-    pynput's macOS keyboard ``Listener`` builds its keycode/input-source context
-    (``keycode_context()``) inside ``_run()`` — i.e. on the *listener thread*. On
-    macOS 15 the underlying ``TIS``/``TSM`` input-source call aborts the whole process
-    (``dispatch_assert_queue`` -> SIGSEGV) when it runs off the main thread, so Record/
-    Play crash instantly. (``Controller`` doesn't crash because it builds that context
-    on the calling thread — see pynput issue #511/#512.)
+    pynput's macOS keyboard ``Listener`` enters ``keycode_context()`` inside ``_run()``
+    — i.e. on the *listener thread*. That contextmanager calls TIS input-source APIs
+    (``TISCopyCurrentKeyboardInputSource`` -> ``islGetInputSourceListWithAdditions``);
+    macOS 15 aborts the whole process (``dispatch_assert_queue`` -> SIGSEGV) when those
+    run off the main thread, so Record/Play crash the instant a listener starts (pynput
+    issue #511/#512). The assertion fires on EVERY off-main-thread call, so merely
+    warming a cache doesn't help — the listener re-enters the context on its own thread.
 
-    Building the same context here, on the main thread, populates the process-global
-    input-source state so the listener thread reuses it instead of rebuilding it
-    off-main-thread. No-op off macOS / when pynput isn't installed."""
+    But ``keycode_context()`` only yields a plain ``(keyboard_type, layout_data)`` tuple,
+    and the actual translation (``UCKeyTranslate``) needs no TIS call. So we build that
+    tuple ONCE here on the main thread (safe — this is what ``Controller`` does) and
+    monkeypatch ``keycode_context`` to yield the cached tuple, so the listener thread
+    never touches TIS again. Keyboard translation still works. Idempotent; no-op off
+    macOS / without pynput."""
     import sys
 
     if sys.platform != "darwin":
         return
     try:
-        from pynput.keyboard._darwin import keycode_context
+        import contextlib
 
-        with keycode_context():
+        from pynput.keyboard import _darwin as kbd
+
+        if getattr(kbd, "_tds_keycode_patched", False):
+            return  # already patched this process
+        if not hasattr(kbd, "keycode_context"):
+            return  # unexpected pynput layout — leave it alone rather than break it
+
+        with kbd.keycode_context() as cached:  # build on the main thread (no assertion here)
             pass
+
+        @contextlib.contextmanager
+        def _cached_keycode_context():
+            yield cached  # the listener thread reuses this; no TIS call -> no SIGSEGV
+
+        kbd.keycode_context = _cached_keycode_context
+        kbd._tds_keycode_patched = True
+        # Some pynput versions resolve the name via the util module too; patch both.
+        try:
+            from pynput._util import darwin as _util_darwin
+            _util_darwin.keycode_context = _cached_keycode_context
+        except Exception:  # noqa: BLE001
+            pass
+        log.debug("patched pynput keycode_context for macOS main-thread safety")
     except Exception as e:  # noqa: BLE001 - never let a warm-up failure block startup
         log.debug("macOS keyboard pre-warm skipped: %s", e)
 

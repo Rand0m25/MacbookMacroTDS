@@ -875,12 +875,16 @@ adversarial review at this depth; the macro is robust for its real (record->play
   thread. So **Record or Play** (which start a `GlobalHotKeys` listener and, for record, a
   `keyboard.Listener`) crash instantly. `Controller` (used for input *injection* on playback) is
   unaffected because it builds the context on the calling thread.
-- **Fix:** `input_backend.prewarm_macos_keyboard()` enters `pynput.keyboard._darwin.keycode_context()`
-  once **on the main thread**, populating the process-global input-source state so the listener
-  thread reuses it instead of rebuilding it off-main-thread. Called at `run_gui` start and at the top
-  of `cmd_play`/`cmd_record` (all main thread). No-op off macOS / without pynput. Recommend the user
-  also `pip install -U pynput` (1.8.2). **NOTE: not verifiable in this Linux dev env — needs the
-  user to confirm on the Mac.**
+- **First fix attempt (insufficient):** merely *pre-warming* `keycode_context()` on the main thread
+  did NOT stop the crash — the `dispatch_assert_queue` assertion fires on EVERY off-main-thread call,
+  and the listener re-enters the context on its own thread regardless of any warmed cache.
+- **Real fix:** `keycode_context()` only yields a plain `(keyboard_type, layout_data)` tuple, and the
+  actual translation (`UCKeyTranslate`) needs no TIS call. So `input_backend.prewarm_macos_keyboard()`
+  builds that tuple ONCE on the main thread (safe — what `Controller` does) and **monkeypatches**
+  `pynput.keyboard._darwin.keycode_context` (and the `_util.darwin` copy) to yield the cached tuple,
+  so the listener thread never calls TIS again. Keyboard translation still works. Idempotent; no-op
+  off macOS / without pynput. Called at `run_gui` start and the top of `cmd_play`/`cmd_record` (all
+  main thread). **NOTE: not verifiable in this Linux dev env — needs the user to confirm on the Mac.**
 - **Why 24 review rounds missed it:** every round was static review + a test suite that runs on Linux
   with MOCK backends (`MockInputBackend`/`MockWindowProvider`); the real pynput listener path is
   never imported or executed in CI, and the crash only exists in the seam between pynput and macOS
