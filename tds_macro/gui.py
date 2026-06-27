@@ -9,6 +9,7 @@ never needs a display.
 
 from __future__ import annotations
 
+import os
 import threading
 from dataclasses import dataclass
 from typing import Callable, Optional
@@ -358,6 +359,10 @@ class GuiController:
 # --------------------------------------------------------------------------- #
 def run_gui(config=None) -> int:
     try:
+        # macOS ships a deprecated system Tk that prints a DEPRECATION WARNING the first time
+        # Tk() initializes; silence it (set before tkinter loads). setdefault respects a user
+        # who deliberately set it to 0. Harmless no-op off macOS.
+        os.environ.setdefault("TK_SILENCE_DEPRECATION", "1")
         import tkinter as tk
         from tkinter import filedialog, ttk
         root = tk.Tk()  # also fails here on a headless box (no $DISPLAY)
@@ -456,13 +461,26 @@ def run_gui(config=None) -> int:
         root.after(200, poll)
     poll()
 
+    closing = False
+
     def on_close():
+        # root.update() below re-pumps the Tk event loop, which can deliver a second
+        # WM_DELETE_WINDOW (or otherwise tear the app down) and re-enter on_close — so the
+        # teardown must run exactly once, or the second root.destroy() hits an already-
+        # destroyed application ("can't invoke destroy command", gui_debug.py).
+        nonlocal closing
+        if closing:
+            return
+        closing = True
         ctrl.stop()  # joins the worker, so a record session is saved before we tear down
         try:
             root.update()  # flush the "saved N events"/"done" after-callbacks so they aren't lost (round 22c #20)
         except Exception:
             pass
-        root.destroy()
+        try:
+            root.destroy()
+        except tk.TclError:
+            pass  # already torn down by a re-entrant close while update() pumped the loop
     root.protocol("WM_DELETE_WINDOW", on_close)
     root.mainloop()
     return 0

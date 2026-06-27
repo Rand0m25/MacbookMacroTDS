@@ -832,6 +832,28 @@ validation CLASS is collapsed; remaining findings are diverse, mostly low/edge-c
 rare timing) or fundamentally ambiguous. "3 clean rounds in a row" is not a reachable target with
 adversarial review at this depth; the macro is robust for its real (record->play) use.
 
+## Real-environment bug — GUI close crash (caught by gui_debug.py, 2026-06-27)
+
+- **Found by:** the user ran the real Tk GUI under a debug launcher (`gui_debug.py`, which tees
+  every uncaught/thread/Tk-callback exception to a log). Closing the window logged
+  `_tkinter.TclError: can't invoke "destroy" command: application has been destroyed` from
+  `gui.py:on_close -> root.destroy()`.
+- **gui.py (med): `on_close` was not re-entrancy-safe.** The `WM_DELETE_WINDOW` handler calls
+  `root.update()` (the round-22c #20 fix, to flush the "saved N events"/"done" after-callbacks).
+  `update()` re-pumps the Tk event loop, which can deliver a **second** queued `WM_DELETE_WINDOW`
+  and re-enter `on_close` to completion (including its own `root.destroy()`) before the outer call
+  reaches line 465 — so the outer `root.destroy()` runs against an already-destroyed app and
+  raises. **Fix:** a `closing` guard set before `update()` makes the teardown run exactly once
+  (a re-entrant/second close returns immediately), and `root.destroy()` is wrapped in
+  `except tk.TclError` defensively.
+- **Blast-radius scan:** `grep -n 'destroy(|update()|protocol(|mainloop|after('` over `tds_macro/`
+  → the only `root.destroy()` and the only `update()`-inside-a-teardown are this one `on_close`;
+  the other `root.after(...)` callbacks are cancelled when the interpreter is destroyed, so no
+  sibling instance of the class exists.
+- **Tests:** `tests/test_bugfixes_recheck27.py` (+2) — drives the real `run_gui`'s captured
+  `on_close` twice and via a re-entrant `update()`; both reproduce the exact `TclError` on the
+  pre-fix code and pass after. Display-gated (skips headless). **371 pass, ruff + pyflakes clean.**
+
 ## Note: workflow API failures (investigated 2026-06-24)
 Symptoms: `Connection closed mid-response`, `Stream idle timeout`, `StructuredOutput
 retry cap (5) exceeded`. Root cause: transient mid-stream drops on long agent
