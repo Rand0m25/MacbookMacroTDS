@@ -392,8 +392,13 @@ def run_gui(config=None) -> int:
             root.after(0, lambda: log(f"{payload} finished"))
     ctrl.on_event = on_event
 
+    # Tk 9.0 on macOS renders a ttk.Frame gridded with sticky="nsew" but no parent grid
+    # weights as a ZERO-size (blank) window — even a full-window resize won't reveal the
+    # widgets. Packing the frame (the path verified to render on the user's Mac) fills the
+    # toplevel reliably; the children inside still use grid (grid-in-frame is allowed since
+    # frm is a separate container from root).
     frm = ttk.Frame(root)
-    frm.grid(sticky="nsew")
+    frm.pack(fill="both", expand=True)
 
     # strat file row
     ttk.Label(frm, text="Strat file").grid(row=0, column=0, sticky="w", **pad)
@@ -482,5 +487,6 @@ def run_gui(config=None) -> int:
         except tk.TclError:
             pass  # already torn down by a re-entrant close while update() pumped the loop
     root.protocol("WM_DELETE_WINDOW", on_close)
+    root.update_idletasks()  # force the initial layout/paint (some macOS/Tk 9 builds show blank otherwise)
     root.mainloop()
     return 0

@@ -854,6 +854,26 @@ adversarial review at this depth; the macro is robust for its real (record->play
   `on_close` twice and via a re-entrant `update()`; both reproduce the exact `TclError` on the
   pre-fix code and pass after. Display-gated (skips headless). **371 pass, ruff + pyflakes clean.**
 
+## Real-environment bug — GUI opens blank on macOS + Tk 9.0 (2026-06-27)
+
+- **Found by:** user on a real Mac (Tk 9.0) — `tds_macro gui` opened a window titled "TDS Macro"
+  but completely empty; resizing/maximizing it did NOT reveal the controls.
+- **Diagnosis (bisected with the user via minimal one-liners):** `.pack()` widgets straight into
+  the root rendered fine (ttk + plain tk both visible), so the Tk build and the aqua theme were OK.
+  The real GUI instead puts every widget in a `ttk.Frame` laid out with `frm.grid(sticky="nsew")`
+  while the root toplevel had **no** `rowconfigure/columnconfigure` weights.
+- **gui.py (high, macOS/Tk9): the gridded frame collapsed to zero size → blank window.** On Tk 9.0
+  for macOS a single `ttk.Frame` gridded with `sticky="nsew"` but no parent grid weight gets a
+  zero-size cell allocation, clipping all 22 children; because the cell has no weight, even a window
+  resize can't grow it, so the window stays blank at any size. **Fix:** pack the frame
+  (`frm.pack(fill="both", expand=True)`) — the exact path verified to render on the user's Mac;
+  children inside still use grid (grid-in-frame is allowed, frm being a separate container). Added a
+  `root.update_idletasks()` before `mainloop()` to force the initial paint (cheap insurance against
+  the first-paint-blank class). Verified headlessly: the frame now reports a non-zero requested size
+  (1031x498) with all 22 children.
+- **Blast-radius scan:** the only `.grid()`-on-a-top-level-container site was this one frame; all
+  other `.grid()` calls are children *inside* `frm`, which render correctly once the frame fills.
+
 ## Note: workflow API failures (investigated 2026-06-24)
 Symptoms: `Connection closed mid-response`, `Stream idle timeout`, `StructuredOutput
 retry cap (5) exceeded`. Root cause: transient mid-stream drops on long agent
