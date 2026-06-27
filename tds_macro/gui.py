@@ -370,6 +370,11 @@ def run_gui(config=None) -> int:
         print(f"GUI unavailable ({type(e).__name__}: {e}). Use the CLI instead.")
         return 1
 
+    # Build pynput's macOS keyboard context on THIS (main) thread before any Record/Play
+    # starts a listener thread, or macOS 15 SIGSEGVs the process (pynput #511/#512).
+    from .input_backend import prewarm_macos_keyboard
+    prewarm_macos_keyboard()
+
     root.title("TDS Macro")
     # Honor the config the `gui` CLI command built (--mock, --private-server, --window-rect, …);
     # without this it was silently ignored and a fresh default Config used (round 23 #16).

@@ -205,6 +205,8 @@ def cmd_record(args) -> int:
             print("  - " + p)
         return 1
     window, input_backend, capture, _cmp = _build_backends(config)
+    from .input_backend import prewarm_macos_keyboard
+    prewarm_macos_keyboard()  # main-thread warm-up so the listener thread won't SIGSEGV on macOS 15 (#511/#512)
     header = Header(name=args.name or "", map=args.map or "", difficulty=args.difficulty or "",
                     created=datetime.now(timezone.utc).isoformat(), created_by=os.environ.get("USER", ""))
     hk = HotkeyManager(config)
@@ -261,6 +263,8 @@ def cmd_play(args) -> int:
             print("  - " + p)
         return 1
     window, input_backend, capture, comparator = _build_backends(config)
+    from .input_backend import prewarm_macos_keyboard
+    prewarm_macos_keyboard()  # main-thread warm-up so the listener thread won't SIGSEGV on macOS 15 (#511/#512)
 
     if permissions.is_macos() and not config.dry_run:
         try:

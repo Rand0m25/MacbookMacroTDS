@@ -854,25 +854,39 @@ adversarial review at this depth; the macro is robust for its real (record->play
   `on_close` twice and via a re-entrant `update()`; both reproduce the exact `TclError` on the
   pre-fix code and pass after. Display-gated (skips headless). **371 pass, ruff + pyflakes clean.**
 
-## Real-environment bug — GUI opens blank on macOS + Tk 9.0 (2026-06-27)
+## Real-environment bug — GUI "blank then crash" on macOS 15 = pynput off-main-thread SIGSEGV (2026-06-27)
 
-- **Found by:** user on a real Mac (Tk 9.0) — `tds_macro gui` opened a window titled "TDS Macro"
-  but completely empty; resizing/maximizing it did NOT reveal the controls.
-- **Diagnosis (bisected with the user via minimal one-liners):** `.pack()` widgets straight into
-  the root rendered fine (ttk + plain tk both visible), so the Tk build and the aqua theme were OK.
-  The real GUI instead puts every widget in a `ttk.Frame` laid out with `frm.grid(sticky="nsew")`
-  while the root toplevel had **no** `rowconfigure/columnconfigure` weights.
-- **gui.py (high, macOS/Tk9): the gridded frame collapsed to zero size → blank window.** On Tk 9.0
-  for macOS a single `ttk.Frame` gridded with `sticky="nsew"` but no parent grid weight gets a
-  zero-size cell allocation, clipping all 22 children; because the cell has no weight, even a window
-  resize can't grow it, so the window stays blank at any size. **Fix:** pack the frame
-  (`frm.pack(fill="both", expand=True)`) — the exact path verified to render on the user's Mac;
-  children inside still use grid (grid-in-frame is allowed, frm being a separate container). Added a
-  `root.update_idletasks()` before `mainloop()` to force the initial paint (cheap insurance against
-  the first-paint-blank class). Verified headlessly: the frame now reports a non-zero requested size
-  (1031x498) with all 22 children.
-- **Blast-radius scan:** the only `.grid()`-on-a-top-level-container site was this one frame; all
-  other `.grid()` calls are children *inside* `frm`, which render correctly once the frame fills.
+- **Found by:** user on a real Mac (macOS 15.6, Python 3.12, Tk 9.0). `tds_macro gui` showed a
+  window titled "TDS Macro" that looked blank, then the process died.
+- **Two WRONG guesses first (recorded as a lesson):** (1) "macOS ships deprecated Tk 8.5" — false,
+  the user had Tk 9.0; (2) "the `ttk.Frame` gridded with `sticky=nsew` collapses to zero size" —
+  false, a minimal frame+grid rendered fine for the user. Both were fixed-by-guess and pushed before
+  confirming, which the diagnosis below overturned. (The pack-the-frame + `update_idletasks` change
+  was kept — harmless and the render path is confirmed — but it was NOT the cause.)
+- **Real diagnosis (from a committed `gui_debug.py` that dumps the widget tree + installs crash
+  hooks, run on the Mac):** the widget tree showed **all 22 widgets `mapped=1` with real geometry**
+  — the GUI renders perfectly. The macOS crash report showed a **SIGSEGV on a worker thread**:
+  `dispatch_assert_queue → islGetInputSourceListWithAdditions → TSMGetInputSourceProperty`, reached
+  via `ffi_call → _ctypes_callproc` (i.e. **pynput**). The "blank" window was just the unpainted
+  shell shown for the moment before the crash raced in.
+- **Root cause (pynput vs macOS 15, issue #511/#512):** pynput's macOS keyboard `Listener` builds
+  its keycode/input-source context (`keycode_context()`) inside `_run()` — on the *listener thread*.
+  macOS 15 aborts the process (`dispatch_assert_queue`) when that `TIS`/`TSM` call runs off the main
+  thread. So **Record or Play** (which start a `GlobalHotKeys` listener and, for record, a
+  `keyboard.Listener`) crash instantly. `Controller` (used for input *injection* on playback) is
+  unaffected because it builds the context on the calling thread.
+- **Fix:** `input_backend.prewarm_macos_keyboard()` enters `pynput.keyboard._darwin.keycode_context()`
+  once **on the main thread**, populating the process-global input-source state so the listener
+  thread reuses it instead of rebuilding it off-main-thread. Called at `run_gui` start and at the top
+  of `cmd_play`/`cmd_record` (all main thread). No-op off macOS / without pynput. Recommend the user
+  also `pip install -U pynput` (1.8.2). **NOTE: not verifiable in this Linux dev env — needs the
+  user to confirm on the Mac.**
+- **Why 24 review rounds missed it:** every round was static review + a test suite that runs on Linux
+  with MOCK backends (`MockInputBackend`/`MockWindowProvider`); the real pynput listener path is
+  never imported or executed in CI, and the crash only exists in the seam between pynput and macOS
+  15's main-thread enforcement — an environment/integration fault on an OS the suite never runs on,
+  not a logic bug in our code. (See the GUI feature notes: the view was only ever "Xvfb-verified to
+  build", never run on real macOS.)
 
 ## Note: workflow API failures (investigated 2026-06-24)
 Symptoms: `Connection closed mid-response`, `Stream idle timeout`, `StructuredOutput

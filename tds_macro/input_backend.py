@@ -23,6 +23,33 @@ from .errors import PanicAbort
 
 log = logging.getLogger("tds_macro.input_backend")
 
+
+def prewarm_macos_keyboard() -> None:
+    """Work around a pynput-vs-macOS-15 crash (SIGSEGV) — call ONCE on the MAIN thread.
+
+    pynput's macOS keyboard ``Listener`` builds its keycode/input-source context
+    (``keycode_context()``) inside ``_run()`` — i.e. on the *listener thread*. On
+    macOS 15 the underlying ``TIS``/``TSM`` input-source call aborts the whole process
+    (``dispatch_assert_queue`` -> SIGSEGV) when it runs off the main thread, so Record/
+    Play crash instantly. (``Controller`` doesn't crash because it builds that context
+    on the calling thread — see pynput issue #511/#512.)
+
+    Building the same context here, on the main thread, populates the process-global
+    input-source state so the listener thread reuses it instead of rebuilding it
+    off-main-thread. No-op off macOS / when pynput isn't installed."""
+    import sys
+
+    if sys.platform != "darwin":
+        return
+    try:
+        from pynput.keyboard._darwin import keycode_context
+
+        with keycode_context():
+            pass
+    except Exception as e:  # noqa: BLE001 - never let a warm-up failure block startup
+        log.debug("macOS keyboard pre-warm skipped: %s", e)
+
+
 # --- key string codec (S9) ----------------------------------------------------
 # Stable lowercase names <-> pynput Key members. Single characters map to chars.
 _SPECIAL_NAMES = (
