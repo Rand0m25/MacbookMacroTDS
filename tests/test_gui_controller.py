@@ -192,3 +192,40 @@ def test_status_idle():
     ctrl, _, _ = _setup()
     s = ctrl.status()
     assert s["busy"] is False and s["activity"] == "idle"
+
+
+# -- empty / ~ strat path ("couldn't find the directory to save it to") --
+def test_start_record_rejects_empty_path():
+    ctrl, h, events = _setup()
+    assert ctrl.start_record("") is False
+    assert ctrl.start_record("   ") is False
+    assert not ctrl.is_busy()
+    assert h.get("recorder") is None  # engine never built, nothing recorded/lost
+    assert any(k == "error" for k, _ in events)
+
+
+def test_start_play_rejects_empty_path():
+    ctrl, h, events = _setup()
+    assert ctrl.start_play("") is False
+    assert not ctrl.is_busy()
+    assert h.get("player") is None
+    assert any(k == "error" for k, _ in events)
+
+
+def test_validate_rejects_empty_path():
+    ctrl, _, _ = _setup()
+    ok, problems = ctrl.validate("   ")
+    assert ok is False and problems
+
+
+def test_paths_expand_tilde():
+    import os
+    seen = {}
+
+    def cap(p):
+        seen["p"] = p
+        return S.StratFile(base_dir=".")
+
+    ctrl, _, _ = _setup(load=cap)
+    ctrl.validate("~/run.strat.json")
+    assert seen["p"] == os.path.expanduser("~/run.strat.json") and "~" not in seen["p"]

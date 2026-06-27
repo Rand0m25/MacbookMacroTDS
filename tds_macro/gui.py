@@ -178,6 +178,9 @@ class GuiController:
     def validate(self, path: str, private_server: str = ""):
         from .errors import StratValidationError
 
+        path = os.path.expanduser((path or "").strip())
+        if not path:
+            return False, ["choose a strat file first"]
         try:
             st = self.deps.load_strat(path)
         except StratValidationError as e:
@@ -203,6 +206,10 @@ class GuiController:
     # -- Play button --
     def start_play(self, path: str, *, loop_count=0, dry_run=False,
                    private_server="", accept_ban_risk=False) -> bool:
+        path = os.path.expanduser((path or "").strip())  # expand ~; an empty path is a clear error
+        if not path:
+            self._emit("error", "choose a strat file to play first")
+            return False
         with self._lock:
             if self._activity != "idle":
                 self._emit("error", "already running")
@@ -243,6 +250,12 @@ class GuiController:
 
     # -- Record button --
     def start_record(self, path: str, *, name="", map="", difficulty="", private_server="") -> bool:
+        # Expand ~ (a Tk entry doesn't) and reject an empty path up front: otherwise the save at the
+        # end of recording fails deep in os.replace with a cryptic "No such file or directory".
+        path = os.path.expanduser((path or "").strip())
+        if not path:
+            self._emit("error", "choose a file to save the recording to first (e.g. ~/tds_run.strat.json)")
+            return False
         with self._lock:
             if self._activity != "idle":
                 self._emit("error", "already running")
