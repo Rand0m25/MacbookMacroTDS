@@ -160,6 +160,17 @@ class Recorder:
         self._dz_px = dz_px
         self._sync_count = 0
         self._pressed_keys: set = set()  # keys whose press we recorded (for paired releases)
+        # The control hotkeys (panic/start/pause/mark-sync) drive the RECORDING session itself; they
+        # must never be captured as game input, or replay re-presses them — and a recorded panic key
+        # (default F8) would make the macro stop itself mid-run (observed in a real user recording).
+        # Split combos like "ctrl+p" into their individual keys: _on_press fires once per physical key
+        # (already normalized to a single name), so we must match each constituent, not the whole string.
+        self._hotkey_keys = {
+            tok.strip().lower()
+            for name in ("panic_hotkey", "start_hotkey", "pause_hotkey", "mark_sync_hotkey")
+            for tok in str(getattr(config, name, "")).split("+")
+            if tok.strip()
+        }
         self._strat_dir = ""  # set in run(); init here so build()/capture_sync_point() are safe early
 
     def _now_ms(self) -> int:
@@ -228,6 +239,8 @@ class Recorder:
 
     def _on_press(self, key):
         if self._recording_paused():  # excluded from the recording while paused (round 18 #3)
+            return
+        if str(key).lower() in self._hotkey_keys:  # F8/F10/… are session controls, not game input
             return
         if not self.window.is_frontmost():  # R27: ignore keys aimed at another app (D14)
             return

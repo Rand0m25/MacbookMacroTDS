@@ -1,7 +1,46 @@
 """Recorder coalescer rules (plan S5)."""
 
-from tds_macro.recorder import EventCoalescer
+from tds_macro.recorder import EventCoalescer, Recorder
 from tds_macro.geometry import Point
+from tds_macro.window import MockWindowProvider
+from tds_macro.capture import MockCaptureBackend
+from tds_macro.input_backend import MockInputBackend
+from tds_macro.hotkeys import HotkeyManager, HotkeyEvents
+from tds_macro.clock import FakeClock
+
+from helpers import mock_config
+
+
+def test_control_hotkeys_excluded_from_recording():
+    # The panic (F8) / mark-sync (F10) / pause (F7) / start (F9) hotkeys drive the recording SESSION;
+    # capturing them as game input would re-press them on replay — and a recorded F8 would make the
+    # macro stop ITSELF mid-run (seen in a real user recording). They must never enter the strat.
+    rec = Recorder(MockWindowProvider(rect=(0, 0, 1000, 1000), frontmost=True), MockInputBackend(),
+                   MockCaptureBackend(), mock_config(), HotkeyManager(mock_config(), HotkeyEvents()),
+                   clock=FakeClock())
+    rec._t0 = 0.0
+    rec._refresh_geo()
+    for k in ["f8", "F10", "a", "f7", "f9"]:  # mixed case to prove case-insensitive filtering
+        rec._on_press(k)
+        rec._on_release(k)
+    evs = rec.coalescer.finish()
+    keys = [e.key for e in evs if e.type in ("key_press", "key_release")]
+    assert keys == ["a", "a"]  # only the real game key survives (paired press + release)
+
+
+def test_combo_hotkey_constituents_excluded_from_recording():
+    # a combo hotkey (e.g. pause = ctrl+p) fires as individual keys; each constituent must be filtered,
+    # or replaying them could reconstitute the combo and pause/stop the macro itself (review round 25).
+    cfg = mock_config(pause_hotkey="ctrl+p")
+    rec = Recorder(MockWindowProvider(rect=(0, 0, 1000, 1000), frontmost=True), MockInputBackend(),
+                   MockCaptureBackend(), cfg, HotkeyManager(cfg, HotkeyEvents()), clock=FakeClock())
+    rec._t0 = 0.0
+    rec._refresh_geo()
+    for k in ["p", "a"]:  # 'p' is part of ctrl+p; 'a' is real game input
+        rec._on_press(k)
+        rec._on_release(k)
+    keys = [e.key for e in rec.coalescer.finish() if e.type in ("key_press", "key_release")]
+    assert keys == ["a", "a"]
 
 
 def test_double_click_merge_and_pre_move_dropped():

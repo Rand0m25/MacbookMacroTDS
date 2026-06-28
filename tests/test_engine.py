@@ -5,10 +5,89 @@ from tds_macro.capture import MockCaptureBackend
 from tds_macro.input_backend import MockInputBackend
 from tds_macro.hotkeys import HotkeyManager, HotkeyEvents
 from tds_macro.recovery import MockRecoveryController, Outcome, FailureMode
+from tds_macro.window import MockWindowProvider
+from tds_macro.engine import RunState
 from tds_macro import strat as S
 from tds_macro.geometry import Point
 
 from helpers import build_player, mock_config, mk_sync
+
+
+# --- RunStats.is_failure(): zero-match failures vs benign/successful stops ----------------
+def test_runstats_is_failure():
+    from tds_macro.engine import RunStats
+    # benign / successful -> not a failure
+    assert RunStats(runs=1, stopped_reason="loop_count reached").is_failure() is False
+    assert RunStats(runs=0, stopped_reason="panic").is_failure() is False
+    assert RunStats(runs=0, stopped_reason="session cap reached").is_failure() is False
+    assert RunStats(runs=0, stopped_reason="").is_failure() is False
+    assert RunStats(runs=1, stopped_reason="error: boom").is_failure() is False  # it DID complete a match
+    # zero completed matches + a non-benign reason -> failure
+    assert RunStats(runs=0, stopped_reason="error: WindowNotFoundError: x").is_failure() is True
+    assert RunStats(runs=0, stopped_reason="recovery stopped on wrong_map").is_failure() is True
+    assert RunStats(runs=0,
+                    stopped_reason="aborted after 10 consecutive restarts without a completed run").is_failure() is True
+
+
+# --- foreground validation: input must land in the Roblox window (verify_foreground) ----
+_KEY = S.KeyPressEvent(1, 0, "key_press", key="a")
+_WAIT = S.WaitEvent(1, 0, "wait", duration_ms=10)
+
+
+def _fg_player(*, frontmost, handle_fn=None, **cfgkw):
+    win = MockWindowProvider(frontmost=frontmost)
+    rec = MockRecoveryController(handle_fn=handle_fn or (lambda r, sc: Outcome.RESUME))
+    p, inp, _, _ = build_player(S.StratFile(base_dir="."), cfg=mock_config(**cfgkw),
+                                window=win, recovery=rec)
+    return p, inp, win, rec
+
+
+def test_foreground_gate_skips_input_when_focus_unrecoverable():
+    # not frontmost + recovery returns but can't refocus -> don't fire into the wrong app
+    p, _, _, rec = _fg_player(frontmost=False)
+    assert p._foreground_ok_for_input(_KEY) is False
+    assert rec.handle_calls == [FailureMode.FOCUS_LOST] and p.stats.recoveries == 1
+
+
+def test_foreground_gate_passes_after_refocus():
+    def refocus(reason, scene):
+        win.frontmost = True  # recovery brought Roblox back to the foreground
+        return Outcome.RESUME
+    p, _, win, _ = _fg_player(frontmost=False, handle_fn=refocus)
+    assert p._foreground_ok_for_input(_KEY) is True
+
+
+def test_foreground_gate_passes_when_already_frontmost():
+    p, _, _, rec = _fg_player(frontmost=True)
+    assert p._foreground_ok_for_input(_KEY) is True
+    assert rec.handle_calls == []  # no recovery needed
+
+
+def test_foreground_gate_bypassed_when_disabled():
+    p, _, _, rec = _fg_player(frontmost=False, handle_fn=lambda r, sc: Outcome.STOP,
+                              verify_foreground=False)
+    assert p._foreground_ok_for_input(_KEY) is True  # opted out -> dispatch blind, no recovery
+    assert rec.handle_calls == []
+
+
+def test_foreground_gate_bypassed_in_dry_run():
+    p, _, _, rec = _fg_player(frontmost=False, handle_fn=lambda r, sc: Outcome.STOP, dry_run=True)
+    assert p._foreground_ok_for_input(_KEY) is True  # dry-run sends no input -> nothing to validate
+    assert rec.handle_calls == []
+
+
+def test_foreground_gate_ignores_non_input_events():
+    p, _, _, rec = _fg_player(frontmost=False)
+    assert p._foreground_ok_for_input(_WAIT) is True  # a wait sends nothing, so focus is irrelevant
+    assert rec.handle_calls == []
+
+
+def test_play_sequence_skips_input_without_focus():
+    # end-to-end through _play_sequence: a key event is NOT dispatched while focus is lost
+    p, inp, _, _ = _fg_player(frontmost=False)
+    p._last_guard_ms = p.clock.now_ms()  # throttle the periodic guard so we isolate the per-input gate
+    p._play_sequence([_KEY], RunState.IN_MATCH)
+    assert not any(e["action"] == "key_press" for e in inp.events)
 
 
 class TimedInput(MockInputBackend):

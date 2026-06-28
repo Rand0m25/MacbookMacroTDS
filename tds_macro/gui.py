@@ -91,6 +91,14 @@ def _default_load_strat(path):
     return load(path)
 
 
+def _default_load_strat_lenient(path):
+    # Used only to MERGE a recorded join/leave sequence into an existing strat: we just need its
+    # structure, so skip reference-frame existence checks (a missing frame must not block the merge).
+    from .strat import load
+
+    return load(path, check_frames=False)
+
+
 def _default_save_strat(strat, path):
     from .strat import save
 
@@ -123,6 +131,7 @@ class GuiDeps:
     make_play_engine: Callable = _default_make_play_engine
     make_record_engine: Callable = _default_make_record_engine
     load_strat: Callable = _default_load_strat
+    load_strat_lenient: Callable = _default_load_strat_lenient  # frame-check-free load for join/leave merge
     save_strat: Callable = _default_save_strat
     consent_ok: Callable = _default_consent_ok
     set_consent: Callable = _default_set_consent
@@ -203,6 +212,32 @@ class GuiController:
             return False, problems
         return True, []
 
+    # -- New… button (create a blank strat file instead of choosing one) --
+    def new_strat(self, path: str, *, name="", map="", difficulty="") -> bool:
+        """Create a fresh, well-formed (empty) strat file at PATH so the user can record into /
+        edit it, instead of only being able to pick an existing one. The metadata fields are baked
+        into the header. Overwrites freely — the Tk view's asksaveasfilename already confirms
+        overwrite, and "New" intentionally replaces whatever is there."""
+        from .strat import StratFile
+
+        path = os.path.expanduser((path or "").strip())  # a Tk entry doesn't expand ~; reject empty up front
+        if not path:
+            self._emit("error", "choose a name/location for the new strat file first "
+                                "(e.g. ~/tds_run.strat.json)")
+            return False
+        with self._lock:
+            if self._activity != "idle":  # don't clobber the file a record/play is mid-using
+                self._emit("error", "stop the current activity before creating a new file")
+                return False
+        header = self._make_header(name, map, difficulty)
+        try:
+            self.deps.save_strat(StratFile(header=header), path)
+        except Exception as e:
+            self._emit("error", f"could not create {path}: {e}")
+            return False
+        self._emit("log", f"created new strat file {path}")
+        return True
+
     # -- Play button --
     def start_play(self, path: str, *, loop_count=0, dry_run=False,
                    private_server="", accept_ban_risk=False) -> bool:
@@ -248,13 +283,63 @@ class GuiController:
                                             daemon=True)
         return self._spawn(hk, "play")
 
+    # which StratFile field each record target writes to (and a human label for messages)
+    _TARGET_FIELD = {"events": "events", "join": "join_sequence", "leave": "leave_reset_sequence"}
+
+    def _save_recording_fallback(self, strat, reason: str) -> None:
+        """Last resort so a just-recorded session is never lost: write it to a unique temp file (never
+        the user's chosen path) and surface why. Used when the target file can't be merged-into or
+        written (round 22 #S / review round 24 #A)."""
+        import os
+        import tempfile
+
+        fd, fallback = tempfile.mkstemp(prefix="tds_recording_", suffix=".strat.json")
+        os.close(fd)
+        try:
+            self.deps.save_strat(strat, fallback)
+            self._emit("error", f"{reason}; saved the recording to {fallback}")
+        except Exception as e2:
+            self._emit("error", f"{reason}; and the fallback save also failed ({e2})")
+
+    def _merge_recorded(self, recorded, path: str, target: str):
+        """Decide the StratFile to save for a recording. For ``events`` it's the recording as-is (the
+        old behavior). For ``join``/``leave`` we load the EXISTING strat so its other fields survive and
+        replace ONLY that sequence with the recorded events — so you can add a join/leave sequence to a
+        strat without clobbering its main timeline. ``leave_reset_sequence`` is replayed on a fixed timer
+        and the validator rejects sync_points there, so those are stripped (with a log).
+
+        A genuinely-ABSENT file (FileNotFoundError) starts fresh. But a file that EXISTS yet won't parse
+        must NOT be silently overwritten — that would destroy the user's strat — so we re-raise and let
+        the caller save the raw recording to a fallback file instead (review round 24 #A)."""
+        if target == "events":
+            return recorded
+        events = list(recorded.events)
+        if target == "leave":
+            kept = [e for e in events if getattr(e, "type", "") != "sync_point"]
+            if len(kept) != len(events):
+                self._emit("log", f"stripped {len(events) - len(kept)} sync point(s): "
+                                  "leave_reset_sequence is replayed on a timer, not the visual engine")
+            events = kept
+        try:
+            base = self.deps.load_strat_lenient(path)  # preserve header/events/recovery of the existing strat
+        except FileNotFoundError:
+            base = recorded            # no file yet -> the recording becomes a new strat, but its events
+            base.events = []           # belong in the target sequence, not the main timeline
+        # any OTHER load error (StratValidationError / OSError / JSON) propagates -> caller won't overwrite
+        setattr(base, self._TARGET_FIELD[target], events)
+        return base
+
     # -- Record button --
-    def start_record(self, path: str, *, name="", map="", difficulty="", private_server="") -> bool:
+    def start_record(self, path: str, *, name="", map="", difficulty="", private_server="",
+                     target="events") -> bool:
         # Expand ~ (a Tk entry doesn't) and reject an empty path up front: otherwise the save at the
         # end of recording fails deep in os.replace with a cryptic "No such file or directory".
         path = os.path.expanduser((path or "").strip())
         if not path:
             self._emit("error", "choose a file to save the recording to first (e.g. ~/tds_run.strat.json)")
+            return False
+        if target not in self._TARGET_FIELD:
+            self._emit("error", f"unknown record target {target!r}")
             return False
         with self._lock:
             if self._activity != "idle":
@@ -278,22 +363,23 @@ class GuiController:
             save_strat = self.deps.save_strat
 
             def _do():
-                strat = recorder.run(path, header=header)
+                recorded = recorder.run(path, header=header)
+                field = self._TARGET_FIELD[target]
                 try:
-                    save_strat(strat, path)
-                    self._emit("log", f"saved {len(strat.events)} events to {path}")
+                    out = self._merge_recorded(recorded, path, target)
                 except Exception as e:
-                    # don't lose a just-recorded session if the typed path is unwritable: fall back
-                    # to a unique temp file and tell the user where it is (round 22 #S).
-                    import os
-                    import tempfile
-                    fd, fallback = tempfile.mkstemp(prefix="tds_recording_", suffix=".strat.json")
-                    os.close(fd)
-                    try:
-                        save_strat(strat, fallback)
-                        self._emit("error", f"could not save to {path} ({e}); saved a copy to {fallback}")
-                    except Exception as e2:
-                        self._emit("error", f"could not save the recording ({e}); fallback also failed ({e2})")
+                    # the file EXISTS but couldn't be parsed to merge into. Do NOT overwrite it (that
+                    # would destroy the user's strat) — save the raw recording to a fallback file and
+                    # tell them their original is untouched (review round 24 #A).
+                    self._save_recording_fallback(
+                        recorded, f"could not read {path} to merge into {field} ({e}); it was left untouched")
+                    return
+                try:
+                    save_strat(out, path)
+                    self._emit("log", f"saved {len(getattr(out, field) or [])} events to {field} of {path}")
+                except Exception as e:
+                    # don't lose a just-recorded session if the typed path is unwritable (round 22 #S)
+                    self._save_recording_fallback(out, f"could not save to {path} ({e})")
 
             self._player, self._hk, self._activity = None, hk, "record"
             self._thread = threading.Thread(target=self._run, args=("record", _do, hk), daemon=True)
@@ -352,9 +438,24 @@ class GuiController:
         except Exception:
             pass
 
+    def _surface_failed_play(self, activity: str) -> None:
+        """A play that completed ZERO matches and failed (cold-start launch whose window never appeared,
+        recovery giving up, restart budget exhausted) is swallowed by Player.run() into a graceful
+        stopped_reason and returns normally — so without this the GUI would only log 'play finished' with
+        no hint of the failure (review round 24 #2/#B). Emit an explicit error in that case. Shares
+        RunStats.is_failure() with the CLI exit code so the two agree."""
+        with self._lock:
+            player = self._player
+        if activity != "play" or player is None:
+            return
+        stats = getattr(player, "stats", None)
+        if stats is not None and stats.is_failure():
+            self._emit("error", f"play failed: {stats.stopped_reason or 'no matches completed'}")
+
     def _run(self, activity, fn, hk) -> None:
         try:
             fn()
+            self._surface_failed_play(activity)  # turn a silent zero-match failure into an error event
         except Exception as e:
             self._emit("error", f"{activity} crashed: {e}")
         finally:
@@ -418,23 +519,38 @@ def run_gui(config=None) -> int:
     frm = ttk.Frame(root)
     frm.pack(fill="both", expand=True)
 
+    # metadata + link vars (defined before the strat-file row so New… can read them into the header)
+    name_var, map_var, diff_var, link_var = (tk.StringVar() for _ in range(4))
+
     # strat file row
     ttk.Label(frm, text="Strat file").grid(row=0, column=0, sticky="w", **pad)
     path_var = tk.StringVar()
     ttk.Entry(frm, textvariable=path_var, width=44).grid(row=0, column=1, columnspan=2, **pad)
+    # Browse… picks an EXISTING file (open dialog); New… names a not-yet-existing one (save dialog)
+    # and creates a blank strat there, so you don't have to hand-type a path to record into.
     ttk.Button(frm, text="Browse…",
                command=lambda: path_var.set(filedialog.askopenfilename() or path_var.get())
                ).grid(row=0, column=3, **pad)
+
+    def do_new():
+        chosen = filedialog.asksaveasfilename(
+            title="Create new strat file", defaultextension=".strat.json",
+            initialfile="tds_run.strat.json",
+            filetypes=[("Strat files", "*.strat.json"), ("JSON", "*.json"), ("All files", "*.*")])
+        if not chosen:  # user cancelled — leave the current path untouched
+            return
+        if ctrl.new_strat(chosen, name=name_var.get(), map=map_var.get(), difficulty=diff_var.get()):
+            path_var.set(chosen)  # only adopt the path once the file actually got created
+    ttk.Button(frm, text="New…", command=do_new).grid(row=0, column=4, **pad)
 
     def do_validate():
         ok, problems = ctrl.validate(path_var.get(), private_server=link_var.get())  # vet the link too (round 23 #10)
         log("valid ✓" if ok else "invalid ✗")
         for p in problems:
             log("  - " + p)
-    ttk.Button(frm, text="Validate", command=do_validate).grid(row=0, column=4, **pad)
+    ttk.Button(frm, text="Validate", command=do_validate).grid(row=0, column=5, **pad)
 
     # metadata + link
-    name_var, map_var, diff_var, link_var = (tk.StringVar() for _ in range(4))
     for i, (lbl, var) in enumerate([("Name", name_var), ("Map", map_var), ("Difficulty", diff_var)]):
         ttk.Label(frm, text=lbl).grid(row=1, column=i * 2, sticky="e", **pad)
         ttk.Entry(frm, textvariable=var, width=14).grid(row=1, column=i * 2 + 1, **pad)
@@ -450,11 +566,23 @@ def run_gui(config=None) -> int:
     ttk.Checkbutton(frm, text="Dry run", variable=dry_var).grid(row=3, column=2, **pad)
     ttk.Checkbutton(frm, text="Accept ban risk", variable=ban_var).grid(row=3, column=3, **pad)
 
+    # which sequence Record captures into. Main timeline = the in-match events (default); the other two
+    # let you record the lobby rejoin (join_sequence) and the Roblox leave/reset path (leave_reset_sequence)
+    # straight into the same strat file instead of hand-merging JSON.
+    _TARGET_LABELS = {"Main timeline": "events", "Join sequence": "join", "Leave/reset sequence": "leave"}
+    target_var = tk.StringVar(value="Main timeline")
+    ttk.Label(frm, text="Record into").grid(row=3, column=4, sticky="e", **pad)
+    ttk.Combobox(frm, textvariable=target_var, state="readonly", width=18,
+                 values=list(_TARGET_LABELS)).grid(row=3, column=5, **pad)
+
     # actions
     def do_record():
+        target = _TARGET_LABELS.get(target_var.get(), "events")
         if ctrl.start_record(path_var.get(), name=name_var.get(), map=map_var.get(),
-                             difficulty=diff_var.get(), private_server=link_var.get()):
-            log("recording… press Stop (or F8) to finish")
+                             difficulty=diff_var.get(), private_server=link_var.get(), target=target):
+            into = "main timeline" if target == "events" else f"{target} sequence"
+            log(f"recording into {into}… press Stop (or F8) to finish"
+                + ("  (don't drop sync points — F10 — into the leave sequence)" if target == "leave" else ""))
 
     def do_play():
         try:
@@ -471,10 +599,10 @@ def run_gui(config=None) -> int:
     ttk.Button(frm, text="Stop / Panic", command=ctrl.stop).grid(row=4, column=3, **pad)
 
     status_var = tk.StringVar(value="idle")
-    ttk.Label(frm, textvariable=status_var).grid(row=5, column=0, columnspan=5, sticky="w", **pad)
+    ttk.Label(frm, textvariable=status_var).grid(row=5, column=0, columnspan=6, sticky="w", **pad)
 
     logbox = tk.Text(frm, height=12, width=70, state="disabled")
-    logbox.grid(row=6, column=0, columnspan=5, **pad)
+    logbox.grid(row=6, column=0, columnspan=6, **pad)
 
     def poll():
         s = ctrl.status()

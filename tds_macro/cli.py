@@ -1,4 +1,4 @@
-"""Command-line entrypoint: record | play | validate | calibrate | check-perms | smoke.
+"""Command-line entrypoint: new | record | play | validate | calibrate | check-perms | smoke.
 
 Functionality-first, no GUI. SIGINT/SIGTERM handlers are installed on the MAIN
 thread and only set the panic Event; the engine runs on a worker thread so a
@@ -118,6 +118,15 @@ def _run_with_signals(player, hotkeys):
     return box.get("stats")
 
 
+def _play_exit_code(stats) -> int:
+    """Map a finished run to a process exit code. 1 = a worker crash (stats is None) OR a run that
+    completed ZERO matches and failed (RunStats.is_failure(): cold-start launch error, recovery gave up,
+    restart budget exhausted, …). 0 = it ran, or stopped cleanly (loop_count / session cap / panic).
+    run() swallows startup/recovery failures into a graceful stopped_reason and returns stats, so
+    without this a bot that never completed a match would falsely exit 0 (review round 24 #1/#B)."""
+    return 1 if (stats is None or stats.is_failure()) else 0
+
+
 def _check_consent(args) -> bool:
     if getattr(args, "accept_ban_risk", False):
         try:
@@ -188,6 +197,26 @@ def cmd_check_perms(args) -> int:
     for m in status.messages:
         print("  " + ui.style("- ", "red") + m)
     return 1
+
+
+def cmd_new(args) -> int:
+    """Create a fresh, empty strat file you can then record into / hand-edit, instead of
+    having to start from an existing one. Refuses to clobber an existing file unless --force."""
+    from .strat import Header, StratFile, save
+
+    if os.path.exists(args.strat) and not args.force:
+        ui.err(f"{args.strat} already exists (use --force to overwrite)")
+        return 1
+    header = Header(name=args.name or "", map=args.map or "", difficulty=args.difficulty or "",
+                    created=datetime.now(timezone.utc).isoformat(), created_by=os.environ.get("USER", ""))
+    try:
+        save(StratFile(header=header), args.strat)
+    except OSError as e:  # unwritable dir / full disk: report cleanly, mirror cmd_record (round 22 #Q)
+        ui.err(f"could not create {args.strat}: {e}")
+        return 1
+    ui.ok(f"created new strat file {args.strat}")
+    ui.info(f"next: record into it with  python -m tds_macro record {args.strat}")
+    return 0
 
 
 def cmd_record(args) -> int:
@@ -289,8 +318,13 @@ def cmd_play(args) -> int:
         return 1
     finally:
         hk.stop()
-    if stats is None:
-        return 1  # worker crashed (already reported); non-zero exit for CI/shell (D-r3)
+    if _play_exit_code(stats) != 0:
+        # completed ZERO matches and failed (e.g. a cold-start launch whose window never appeared, or
+        # recovery gave up / exhausted the restart budget). run() swallows these into a graceful
+        # stopped_reason, so without this it would print the green "done" line and exit 0 — a false
+        # success for a bot that never ran a match (review round 24 #1/#B).
+        ui.err("play failed: " + (stats.stopped_reason if stats else "worker crashed"))
+        return 1
     ui.ok("done  " + "  ".join([
         ui.kv("runs", stats.runs), ui.kv("restarts", stats.restarts),
         ui.kv("wins", stats.wins, good=True), ui.kv("losses", stats.losses, good=False),
@@ -399,6 +433,11 @@ def _add_common(p):
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="tds_macro", description="TDS macro: record/play with visual-sync + recovery")
     sub = parser.add_subparsers(dest="cmd", required=True)
+
+    pn = sub.add_parser("new", help="create a fresh, empty strat file to record into / edit")
+    pn.add_argument("strat"); pn.add_argument("--name"); pn.add_argument("--map"); pn.add_argument("--difficulty")
+    pn.add_argument("--force", action="store_true", help="overwrite the file if it already exists")
+    pn.set_defaults(func=cmd_new)
 
     pr = sub.add_parser("record", help="record your play into a strat file")
     pr.add_argument("strat"); pr.add_argument("--name"); pr.add_argument("--map"); pr.add_argument("--difficulty")

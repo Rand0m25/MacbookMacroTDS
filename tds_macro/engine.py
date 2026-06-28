@@ -23,7 +23,7 @@ from enum import Enum
 from typing import Callable, Optional
 
 from .config import Config
-from .errors import PanicAbort
+from .errors import PanicAbort, WindowNotFoundError
 from .frame import Frame
 from .geometry import Coordinates, Point, WindowGeometry
 from .recovery import FailureMode, Outcome
@@ -56,6 +56,9 @@ class WaitResult(str, Enum):
     TIMEOUT = "timeout"
 
 
+_BENIGN_ZERO_RUN_REASONS = ("", "panic", "session cap reached")  # not failures even with 0 completed matches
+
+
 @dataclass
 class RunStats:
     runs: int = 0          # matches actually completed (reached run-end)
@@ -65,6 +68,17 @@ class RunStats:
     recoveries: int = 0
     sync_timeouts: int = 0
     stopped_reason: str = ""
+
+    def is_failure(self) -> bool:
+        """A real failure: it completed ZERO matches AND didn't stop for a benign reason — a user
+        panic/Stop, the configured session cap, or a clean (empty) stop. So a cold-start launch that
+        never got a window ('error: ...'), recovery giving up ('recovery stopped on ...'), or the
+        restart budget running out ('aborted after N consecutive restarts ...') all count as failures,
+        while a finished/loop_count/panic/session-cap stop does not. Drives the play exit code and the
+        GUI's failure surfacing so both agree (review round 24 #B)."""
+        if self.runs > 0:
+            return False
+        return (self.stopped_reason or "") not in _BENIGN_ZERO_RUN_REASONS
 
 
 class _RestartLoop(Exception):
@@ -114,13 +128,31 @@ class Player:
         self.stats = RunStats()
         self.state = RunState.IDLE
 
-        self._geo: WindowGeometry = window.get_geometry()
-        self._coords = Coordinates(self._geo)
+        self._private_server_opened = False  # open the private-server link once per session, not every loop
+        # Acquire the window geometry up front. If Roblox isn't running yet we normally fail fast here —
+        # BUT if a private-server link is configured (and this isn't a dry-run preview) we DEFER: run()
+        # will open the link to LAUNCH Roblox, then acquire geometry once its window appears. With no link
+        # there's nothing to launch, so keep the original fail-fast contract (CLI/GUI "could not start").
+        try:
+            self._geo: Optional[WindowGeometry] = window.get_geometry()
+            self._coords: Optional[Coordinates] = Coordinates(self._geo)
+        except WindowNotFoundError:
+            # ONLY a genuinely-absent window is deferrable. Catching every Exception would also swallow
+            # an ImportError / transient Quartz fault / a bad Coordinates() into a needless launch + a
+            # launch_timeout_ms hang — those are real bugs that should fail fast (review round 24 #3).
+            if self.config.dry_run or not self._private_server_url():
+                raise
+            self._geo = None  # deferred; run() -> _ensure_window_or_launch() acquires it after launching
+            self._coords = None
         self._iter_t0 = 0.0
         self.clock_offset = 0.0
         self._last_guard_ms = -1e18
         self._ref_cache: dict[str, Frame] = {}
         self._rng = random.Random(0xC0FFEE)
+
+    # input-bearing primitives whose effect depends on Roblox being the focused window; a WaitEvent
+    # sends nothing, so it needs no foreground gate, and a SyncPointEvent has its own branch.
+    _INPUT_EVENTS = (MouseMoveEvent, ClickEvent, DragEvent, KeyPressEvent, KeyReleaseEvent, ScrollEvent)
 
     # --- helpers ----------------------------------------------------------
     def _should_abort(self) -> bool:
@@ -206,6 +238,23 @@ class Player:
             pass  # the scheduled sleep already realized the delay
         else:
             log.warning("unknown primitive at dispatch: %s", e.type)
+
+    def _foreground_ok_for_input(self, e: Event) -> bool:
+        """Validate Roblox is the frontmost window right before we dispatch an input primitive, so a
+        click/keypress can never land in another app. Unlike _maybe_run_guards this is NOT throttled —
+        it runs on every input event. On focus loss it routes the FOCUS_LOST recovery (activate + settle,
+        budget -> STOP); if focus still isn't ours afterward the caller skips the primitive instead of
+        firing blind. Dry-run and verify_foreground=False bypass it (no input is sent / opted out)."""
+        if self.config.dry_run or not self.config.verify_foreground:
+            return True
+        if not isinstance(e, self._INPUT_EVENTS):
+            return True  # WaitEvent etc. send nothing
+        if self.window.is_frontmost():
+            return True
+        log.warning("Roblox not frontmost before %s id=%s -> recovering focus before sending input",
+                    e.type, e.id)
+        self._route_recovery(FailureMode.FOCUS_LOST)  # RESUME on refocus, else raises _StopRun
+        return self.window.is_frontmost()
 
     # --- the adaptive visual-sync barrier --------------------------------
     def _adaptive_wait(self, sync: SyncPointEvent) -> tuple[WaitResult, Optional[Frame]]:
@@ -321,8 +370,64 @@ class Player:
         self._absorb_wall_time(started)
         self.state = prev if prev != RunState.RECOVERY else RunState.IN_MATCH
 
+    # --- sync-point localization (opt-in: find which checkpoint we're at, by matching ALL sync frames) ---
+    def _reanchor_to(self, sync_t_ms: int) -> None:
+        """Re-anchor the timeline so the event at ``sync_t_ms`` fires NOW. Unlike the monotonic
+        stretch-only _rebase_clock, this is a deliberate DISCONTINUITY — used only when localization
+        jumps execution to a different checkpoint. Callers must also reset prev_target to None."""
+        self._iter_t0 = self.clock.now_ms() - sync_t_ms
+        self.clock_offset = 0.0
+
+    def _localize_against_syncs(self, prims, sync_idxs, *, expected_i, live):
+        """Score the live screen against ALL sync frames and return the index of the single best sync to
+        jump to, or None to decline. A candidate must clear max(localize_min_score, its OWN threshold) —
+        so the localizer is never laxer than the barrier it bypasses — and the winner must beat the
+        2nd-best by localize_margin (ambiguous -> decline). Skips action-verify ('expect_') syncs and the
+        expected sync itself; honors localize_allow_rewind (no backward jump by default). Identical
+        regions are grabbed once (the user's full-screen frames would otherwise be 20 identical grabs)."""
+        self._refresh_geo()
+        cache: dict = {}
+
+        def grab(region):
+            key = (region.x, region.y, region.w, region.h)
+            if key not in cache:
+                cache[key] = self.capture.grab_region(self._geo, region)
+            return cache[key]
+
+        scored = []
+        for k in sync_idxs:
+            if k == expected_i:  # "jumping" to where we already are would just re-time-out -> loop
+                continue
+            s = prims[k]
+            if str(s.label).startswith("expect_"):  # action-verify syncs aren't checkpoints
+                continue
+            if expected_i is not None and k < expected_i and not self.config.localize_allow_rewind:
+                continue  # forward-only by default (a rewind re-runs intervening clicks)
+            try:
+                # reuse the barrier's live grab for candidates sharing the timed-out sync's region
+                if live is not None and expected_i is not None and s.region == prims[expected_i].region:
+                    frame = live
+                else:
+                    frame = grab(s.region)
+                ref = self._ref(s.ref_frame, s.label or s.ref_frame)
+                score = self.comparator.score(frame, ref, s.match or self.config.sync_match_method, s.mask or None)
+            except Exception as ex:  # a missing/unreadable frame must not crash playback
+                log.debug("localize: scoring sync %r failed: %s", s.label, ex)
+                continue
+            floor = max(self.config.localize_min_score,
+                        s.threshold if s.threshold is not None else self.config.sync_default_threshold)
+            if score >= floor:
+                scored.append((score, k))
+        if not scored:
+            return None
+        scored.sort(reverse=True)
+        if len(scored) >= 2 and scored[0][0] - scored[1][0] < self.config.localize_margin:
+            log.info("localize: ambiguous (%.3f vs %.3f) -> declining", scored[0][0], scored[1][0])
+            return None
+        return scored[0][1]
+
     # --- sequence playback ------------------------------------------------
-    def _play_sequence(self, events: list[Event], state: RunState) -> None:
+    def _play_sequence(self, events: list[Event], state: RunState, *, localize: bool = False) -> None:
         self.state = state
         # join_sequence and events are independently recorded, each with its own
         # absolute t_ms starting near 0. Rebase the timeline to "now" at the start
@@ -330,8 +435,23 @@ class Player:
         self._iter_t0 = self.clock.now_ms()
         self.clock_offset = 0.0
         prims = expand_all(events)
+        sync_idxs = [k for k, e in enumerate(prims) if isinstance(e, SyncPointEvent)]
         prev_target = None
-        for e in prims:
+        i = 0
+        resync_jumps = 0
+
+        # Hook A — start-time localization: jump to the checkpoint the live screen is actually at, so a
+        # resume mid-run starts in the right place instead of replaying from the top. Declining keeps i=0,
+        # so a normal fresh start still plays the (un-anchored) opening.
+        if (localize and self.config.localize_on_start and sync_idxs and not self.config.dry_run):
+            j = self._localize_against_syncs(prims, sync_idxs, expected_i=None, live=None)
+            if j is not None:
+                i = j  # land ON the matched sync so its full barrier re-confirms before any input fires
+                self._reanchor_to(prims[j].t_ms)
+                log.info("localize: starting at sync %r (index %d)", prims[j].label, j)
+
+        while i < len(prims):
+            e = prims[i]
             self._abort_check()
             self._maybe_pause()
             jit = e.jitter_ms if e.jitter_ms is not None else self.config.jitter_ms  # explicit 0 suppresses (round 22c #7)
@@ -347,9 +467,10 @@ class Player:
             self._maybe_run_guards()
 
             if isinstance(e, SyncPointEvent):
+                jumped = False
                 attempts = 0
                 while True:
-                    result, _window = self._adaptive_wait(e)
+                    result, live = self._adaptive_wait(e)
                     if result == WaitResult.FIRE:
                         self._rebase_clock(e.t_ms)
                         break
@@ -359,10 +480,41 @@ class Player:
                         self._rebase_clock(e.t_ms)  # keep downstream spacing while we retry
                         log.info("sync '%s' retry %d/%d", e.label, attempts, self.config.sync_max_retries)
                         continue
+                    # Hook B — resync-on-timeout: rather than recover, check ALL syncs and JUMP to the one
+                    # the screen actually matches. Skip action-verify ('expect_') syncs (let their
+                    # OUT_OF_CASH path stand) and respect the jump budget. Gated off in dry-run (mirrors
+                    # Hook A) so a preview replays linearly.
+                    if (localize and self.config.localize_on_timeout and not self.config.dry_run
+                            and not str(e.label).startswith("expect_")
+                            and resync_jumps < self.config.localize_max_jumps):
+                        j = self._localize_against_syncs(prims, sync_idxs, expected_i=i, live=live)
+                        if j is not None:
+                            resync_jumps += 1
+                            # the jump skips events i+1..j-1; if a key was pressed before here and its
+                            # release lies in that skipped range it would stay physically held, so drain
+                            # held input first — mirrors the release_all() on the restart/run-complete paths.
+                            try:
+                                self.input.release_all()
+                            except Exception:
+                                pass
+                            i = j  # land ON the matched sync (its barrier re-confirms)
+                            self._reanchor_to(prims[j].t_ms)
+                            prev_target = None
+                            jumped = True
+                            log.info("localize: resynced %r -> %r after timeout", e.label, prims[j].label)
+                            break
                     self._handle_sync_timeout(e)  # escalate (abort/continue/recover)
                     break
+                if jumped:
+                    continue  # i already advanced to the jump target; don't increment past it
+                i += 1
+                continue
+            if not self._foreground_ok_for_input(e):
+                log.warning("skipping %s id=%s: Roblox still not frontmost after recovery", e.type, e.id)
+                i += 1
                 continue
             self._dispatch_primitive(e)
+            i += 1
 
     def _handle_sync_timeout(self, sync: SyncPointEvent) -> None:
         action = sync.on_timeout
@@ -507,20 +659,54 @@ class Player:
 
     def _join(self) -> None:
         """One join path used at loop start AND on every recovery rejoin (design #4):
-        if a private-server link is set, open it and wait for the server to load; then
-        play join_sequence (full lobby nav when there's no link, or post-load clicks when
-        there is). A link that never loads routes to bounded WRONG_MAP recovery."""
+        open the private-server link ONCE per session (you stay in the same server across
+        matches — re-opening it every loop would reload the whole server and pop the
+        "Open Roblox?" handler each time), wait for it to load, then play join_sequence
+        (full lobby nav when there's no link, or post-load re-queue clicks when there is).
+        A real disconnect is handled by recovery, which re-opens the link on its own path.
+        A link that never loads on the first open routes to bounded WRONG_MAP recovery."""
         url = self._private_server_url()
-        if url and not self.config.dry_run:  # dry-run preview must not open links or stall (recheck #w-dry)
-            log.info("join: opening private server link")
+        if url and not self.config.dry_run and not self._private_server_opened:  # dry-run must not open/stall (recheck #w-dry)
+            log.info("join: opening private server link (once per session)")
             self.launcher.open_url(url)
+            self._private_server_opened = True  # never re-open in the main loop; recovery owns any rejoin
             if not self._await_join():
                 self._route_recovery(FailureMode.WRONG_MAP)  # bounded by max_consecutive_restarts
         if self.strat.join_sequence:
             self._play_sequence(self.strat.join_sequence, RunState.LOBBY)
 
+    def _ensure_window_or_launch(self) -> None:
+        """If no Roblox window was found at construction (``_geo is None``) but a private-server link is
+        configured, OPEN the link to LAUNCH Roblox into that server and wait (up to ``launch_timeout_ms``)
+        for its window to appear — so 'Play' works from a cold start instead of failing 'window not found'.
+        No-op when the window is already up, or when there's no link / it's a dry-run (``_arm()`` then
+        surfaces the missing window exactly as before)."""
+        if self._geo is not None:
+            return  # __init__ already acquired geometry — Roblox is running
+        url = self._private_server_url()
+        if not url or self.config.dry_run:
+            return  # nothing to launch with (or dry-run preview) -> let _arm() raise as before
+        self.state = RunState.ARMING  # surface "launching" in the GUI status line while we wait
+        log.info("no Roblox window detected; opening the private server link to launch it")
+        self.launcher.open_url(url)
+        self._private_server_opened = True  # launched here -> _join() must not re-open it this session
+        deadline = self.clock.now_ms() + self.config.launch_timeout_ms
+        while self._geo is None:
+            self._abort_check()  # let panic/stop interrupt a long cold launch
+            try:
+                self._refresh_geo()  # window up yet? on success this sets _geo/_coords and ends the loop
+            except WindowNotFoundError:  # only "not up yet" is retriable; any other error must surface
+                if self.clock.now_ms() >= deadline:
+                    log.warning("launched the private server but no Roblox window appeared within %dms",
+                                self.config.launch_timeout_ms)
+                    return  # _arm()/_refresh_geo() will raise a clear WindowNotFoundError -> graceful stop
+                self.clock.sleep(max(1, self.config.recovery_check_every_ms))
+        log.info("Roblox window detected after launch; waiting for the server to load")
+        self._await_join()  # best-effort: front + (expected map); _verify_expected_map() re-checks in-loop
+
     def run(self) -> RunStats:
         try:
+            self._ensure_window_or_launch()  # cold start: launch Roblox via the private-server link if needed
             self._arm()
             loop_count = self.config.loop_count
             session_start = self.clock.now_ms()  # for the session_max_minutes cap (round 22 #H)
@@ -536,7 +722,8 @@ class Player:
 
                     self._join()  # private-server link and/or recorded lobby clicks
                     self._verify_expected_map()
-                    self._play_sequence(self.strat.events, RunState.IN_MATCH)
+                    # localize only the in-match timeline (join_sequence + recovery replay stay linear)
+                    self._play_sequence(self.strat.events, RunState.IN_MATCH, localize=True)
 
                     end = self._wait_run_end()
                     self.state = RunState.POSTMATCH

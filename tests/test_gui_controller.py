@@ -109,6 +109,52 @@ def test_validate_reports_problems():
     assert ok is False and "boom" in problems
 
 
+# -- New (create a blank strat file instead of choosing one) --
+def test_new_strat_creates_and_saves_blank_file():
+    ctrl, h, events = _setup()
+    assert ctrl.new_strat("fresh.strat.json", name="n", map="m", difficulty="d") is True
+    assert h["saved"], "expected the blank strat to be saved"
+    strat, path = h["saved"][0]
+    assert path == "fresh.strat.json"
+    assert strat.events == [] and strat.header.map == "m" and strat.header.difficulty == "d"
+    assert any(k == "log" for k, _ in events)
+
+
+def test_new_strat_rejects_empty_path():
+    ctrl, h, events = _setup()
+    assert ctrl.new_strat("") is False
+    assert ctrl.new_strat("   ") is False
+    assert not h["saved"]  # nothing written
+    assert any(k == "error" for k, _ in events)
+
+
+def test_new_strat_expands_tilde():
+    import os
+    ctrl, h, _ = _setup()
+    assert ctrl.new_strat("~/fresh.strat.json") is True
+    _, path = h["saved"][0]
+    assert path == os.path.expanduser("~/fresh.strat.json") and "~" not in path
+
+
+def test_new_strat_blocked_while_busy():
+    ctrl, h, events = _setup()
+    assert ctrl.start_play("x.json") is True
+    assert h["player"].started.wait(1.0)
+    try:
+        assert ctrl.new_strat("fresh.strat.json") is False  # don't clobber the file play is using
+        assert any(k == "error" for k, _ in events)
+    finally:
+        ctrl.stop()
+
+
+def test_new_strat_reports_save_failure():
+    def boom(strat, path):
+        raise OSError("read-only filesystem")
+    ctrl, _, events = _setup(save_strat=boom)
+    assert ctrl.new_strat("fresh.strat.json") is False
+    assert any(k == "error" for k, _ in events)
+
+
 # -- Play --
 def test_play_starts_and_stop_ends_it():
     ctrl, h, _ = _setup()
@@ -150,6 +196,65 @@ def test_busy_guard_blocks_second_activity():
     ctrl.stop()
 
 
+def _wait_done(events, timeout=2.0):
+    deadline = time.time() + timeout
+    while time.time() < deadline and not any(k == "done" for k, _ in events):
+        time.sleep(0.002)
+
+
+class _ImmediatePlayer:
+    """A Player whose run() returns at once, leaving preset stats — to drive _run's post-run handling."""
+    def __init__(self, runs, reason):
+        self.stats = RunStats()
+        self.stats.runs = runs
+        self.stats.stopped_reason = reason
+        self.state = RunState.STOPPING
+
+    def run(self):
+        return
+
+
+def test_play_surfaces_startup_failure_as_error():
+    # cold-start launch that never got a window: run() returns normally with runs == 0 + 'error:' reason;
+    # the GUI must surface that as an error, not a silent "play finished" (review round 24 #2).
+    ctrl, _, events = _setup()
+    ctrl.deps.make_play_engine = lambda st, cfg: (
+        _ImmediatePlayer(0, "error: WindowNotFoundError: no window"), FakeHK())
+    assert ctrl.start_play("x.json") is True
+    _wait_done(events)
+    assert any(k == "error" and "play failed" in str(p) for k, p in events)
+
+
+def test_play_surfaces_recovery_giveup_as_error():
+    # a zero-match recovery STOP must also be surfaced, not just 'error:' reasons (review round 24 #B)
+    ctrl, _, events = _setup()
+    ctrl.deps.make_play_engine = lambda st, cfg: (
+        _ImmediatePlayer(0, "recovery stopped on wrong_map"), FakeHK())
+    assert ctrl.start_play("x.json") is True
+    _wait_done(events)
+    assert any(k == "error" and "play failed" in str(p) for k, p in events)
+
+
+def test_play_normal_completion_emits_no_spurious_error():
+    # a clean run (a match completed) must NOT be reported as a failure
+    ctrl, _, events = _setup()
+    ctrl.deps.make_play_engine = lambda st, cfg: (
+        _ImmediatePlayer(2, "loop_count reached"), FakeHK())
+    assert ctrl.start_play("x.json") is True
+    _wait_done(events)
+    assert not any(k == "error" for k, _ in events)
+
+
+def test_play_session_cap_zero_runs_emits_no_error():
+    # a configured session-cap stop is benign even with zero matches -> no spurious error
+    ctrl, _, events = _setup()
+    ctrl.deps.make_play_engine = lambda st, cfg: (
+        _ImmediatePlayer(0, "session cap reached"), FakeHK())
+    assert ctrl.start_play("x.json") is True
+    _wait_done(events)
+    assert not any(k == "error" for k, _ in events)
+
+
 # -- Record --
 def test_record_starts_and_saves_on_stop():
     ctrl, h, _ = _setup()
@@ -168,6 +273,126 @@ def test_record_uses_private_server():
         assert h["cfg_kwargs"].get("private_server") == "roblox://srv"
     finally:
         ctrl.stop()
+
+
+# -- Record into join_sequence / leave_reset_sequence --
+class _SeqRecorder:
+    """A recorder whose run() returns a StratFile carrying preset `events`."""
+    def __init__(self, hk, events):
+        self.hk = hk
+        self.events = events
+        self.started = threading.Event()
+
+    def run(self, path, header=None):
+        self.started.set()
+        while not self.hk.events.is_stop():
+            time.sleep(0.002)
+        return S.StratFile(base_dir=".", header=header or S.Header(), events=list(self.events))
+
+
+def _record_target_setup(recorded, **over):
+    """_setup wired so make_record_engine returns a _SeqRecorder yielding `recorded`."""
+    box = {}
+
+    def make_record(cfg):
+        hk = FakeHK()
+        box["rec"] = _SeqRecorder(hk, recorded)
+        return box["rec"], hk
+    ctrl, h, events = _setup(make_record_engine=make_record, **over)
+    return ctrl, h, events, box
+
+
+def _run_record(ctrl, box, path, **kw):
+    assert ctrl.start_record(path, **kw) is True
+    assert box["rec"].started.wait(1.0)
+    ctrl.stop()  # joins the worker, so the merge+save have completed by the time this returns
+
+
+def test_record_into_join_merges_and_preserves_main_timeline():
+    recorded = [S.KeyPressEvent(1, 0, "key_press", key="space"),
+                S.KeyPressEvent(2, 50, "key_press", key="return")]
+    base = S.StratFile(base_dir=".", header=S.Header(map="PW2"),
+                       events=[S.KeyPressEvent(9, 0, "key_press", key="z")])  # existing main timeline
+    ctrl, h, events, box = _record_target_setup(recorded, load_strat_lenient=lambda p: base)
+    _run_record(ctrl, box, "main.strat.json", target="join")
+    out, path = h["saved"][0]
+    assert path == "main.strat.json"
+    assert [e.key for e in out.join_sequence] == ["space", "return"]  # recording -> join_sequence
+    assert [e.key for e in out.events] == ["z"]                       # existing timeline untouched
+    assert out.header.map == "PW2"                                    # existing header preserved
+
+
+def test_record_into_leave_strips_sync_points():
+    recorded = [S.KeyPressEvent(1, 0, "key_press", key="esc"),
+                S.SyncPointEvent(2, 50, "sync_point", label="x", ref_frame="x.png"),
+                S.ClickEvent(3, 100, "click", button="left", pos=S.Point(0.5, 0.5))]
+    ctrl, h, events, box = _record_target_setup(recorded, load_strat_lenient=lambda p: S.StratFile(base_dir="."))
+    _run_record(ctrl, box, "m.strat.json", target="leave")
+    out, _ = h["saved"][0]
+    assert [e.type for e in out.leave_reset_sequence] == ["key_press", "click"]  # sync_point stripped
+    assert any(k == "log" and "stripped 1 sync point" in str(p) for k, p in events)
+
+
+def test_record_into_events_is_unchanged_and_skips_merge_load():
+    recorded = [S.KeyPressEvent(1, 0, "key_press", key="a")]
+
+    def boom(p):
+        raise AssertionError("load_strat_lenient must not be called for the main-timeline target")
+    ctrl, h, events, box = _record_target_setup(recorded, load_strat_lenient=boom)
+    _run_record(ctrl, box, "m.strat.json", target="events")
+    out, _ = h["saved"][0]
+    assert [e.key for e in out.events] == ["a"]
+    assert not out.join_sequence and not out.leave_reset_sequence
+
+
+def test_record_into_join_without_existing_file_creates_fresh():
+    recorded = [S.KeyPressEvent(1, 0, "key_press", key="space")]
+
+    def missing(p):
+        raise FileNotFoundError(p)
+    ctrl, h, events, box = _record_target_setup(recorded, load_strat_lenient=missing)
+    _run_record(ctrl, box, "fresh.strat.json", target="join")
+    out, _ = h["saved"][0]
+    assert [e.key for e in out.join_sequence] == ["space"]
+    assert out.events == []  # the recording went to join_sequence, not the main timeline
+
+
+def test_record_into_join_does_not_destroy_unparseable_existing_file():
+    # a file that EXISTS but won't parse (any non-frame validation error) must NOT be overwritten —
+    # that would wipe the user's main timeline/recovery. Save the recording to a fallback instead
+    # and surface an error (review round 24 #A).
+    from tds_macro.errors import StratValidationError
+    recorded = [S.KeyPressEvent(1, 0, "key_press", key="space")]
+
+    def invalid(p):
+        raise StratValidationError(["coord out of range"])  # present-but-invalid existing strat
+    ctrl, h, events, box = _record_target_setup(recorded, load_strat_lenient=invalid)
+    _run_record(ctrl, box, "existing.strat.json", target="join")
+    assert h["saved"], "the recording must still be saved somewhere (never lost)"
+    assert all(path != "existing.strat.json" for _, path in h["saved"])  # original left untouched
+    assert any(k == "error" and "left untouched" in str(p) for k, p in events)
+
+
+def test_record_into_leave_save_failure_falls_back_without_touching_path():
+    # if the merged strat can't be written to the chosen path, save a copy elsewhere (don't lose it)
+    recorded = [S.KeyPressEvent(1, 0, "key_press", key="esc")]
+    saved = []
+
+    def failing_save(strat, path):
+        if path == "ro.strat.json":
+            raise OSError("read-only filesystem")
+        saved.append((strat, path))
+    ctrl, h, events, box = _record_target_setup(
+        recorded, load_strat_lenient=lambda p: S.StratFile(base_dir="."), save_strat=failing_save)
+    _run_record(ctrl, box, "ro.strat.json", target="leave")
+    assert saved and all(path != "ro.strat.json" for _, path in saved)  # fell back to a temp file
+    assert any(k == "error" and "could not save" in str(p) for k, p in events)
+
+
+def test_start_record_rejects_unknown_target():
+    ctrl, h, events = _setup()
+    assert ctrl.start_record("m.strat.json", target="bogus") is False
+    assert not ctrl.is_busy() and any(k == "error" for k, _ in events)
 
 
 # -- Pause / Stop --

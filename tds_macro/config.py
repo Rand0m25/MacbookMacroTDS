@@ -119,6 +119,19 @@ class Config:
     relaunch_url: str = ""  # roblox://... or https experience URL for RELAUNCH_EXPERIENCE fallback
     private_server_url: str = ""  # roblox private-server link; join by opening it (preferred over join_sequence)
     join_timeout_ms: int = 30000  # how long to wait for the server to load after opening the link
+    launch_timeout_ms: int = 60000  # if Roblox isn't running, how long to wait for its window to appear
+    #                                 after opening the private-server link to LAUNCH it (cold start is slow)
+
+    # --- sync-point localization (opt-in; default OFF -> playback is byte-identical) ---
+    # Instead of trusting the fixed timeline, score the live screen against ALL sync frames to find
+    # which checkpoint we're actually at, and resume there. Only useful when sync regions are SMALL and
+    # DISTINCT — full-screen frames of the same map are non-discriminative and the localizer will decline.
+    localize_on_start: bool = False    # at play start, jump to the matching checkpoint (resume mid-run)
+    localize_on_timeout: bool = False  # on a sync timeout, jump to a matching checkpoint instead of recovering
+    localize_min_score: float = 0.85   # a candidate must clear max(this, the sync's own threshold)
+    localize_margin: float = 0.05      # best must beat 2nd-best by this; ambiguous -> decline (no jump)
+    localize_allow_rewind: bool = False  # forward-only by default (a rewind re-spends cash / re-places towers)
+    localize_max_jumps: int = 20       # cap resync jumps per sequence so it can't thrash
     retina_scale_override: float | None = None
     window_rect_override: tuple[int, int, int, int] | None = None  # (x,y,w,h) for mock/tests
     aspect_warn_tolerance: float = 0.02
@@ -131,6 +144,9 @@ class Config:
 
     # --- behaviour flags ---
     failsafe_corner: bool = True
+    verify_foreground: bool = True  # validate Roblox is frontmost right before every input primitive,
+    #                                 so a click/keypress can never land in another app (else focus is
+    #                                 only checked every recovery_check_every_ms and input fires blind)
     dry_run: bool = False
     log_level: str = "INFO"
 
@@ -250,6 +266,14 @@ class Config:
             problems.append("window_title_match must not contain quotes, backslashes, or newlines")
         if self.join_timeout_ms <= 0:
             problems.append("join_timeout_ms must be > 0")
+        if self.launch_timeout_ms <= 0:
+            problems.append("launch_timeout_ms must be > 0")  # else the launch-wait loop busy-spins/can't time out
+        if not (0.0 <= self.localize_min_score <= 1.0):
+            problems.append("localize_min_score must be in [0, 1]")
+        if self.localize_margin < 0:
+            problems.append("localize_margin must be >= 0")
+        if self.localize_max_jumps < 0:
+            problems.append("localize_max_jumps must be >= 0")
         return problems
 
     def min_sync_timeout_ms(self) -> int:
