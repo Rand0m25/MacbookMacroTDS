@@ -176,6 +176,9 @@ class RecoveryController:
             return Outcome.STOP
 
         if fm == FailureMode.FOCUS_LOST:
+            if self.config.dry_run:
+                return Outcome.RESUME  # a preview must not yank focus (no input is sent) — mirror the
+                #                        dry_run guards on _reconnect/_leave_and_reset (round 26 #4)
             self.window.activate()
             # activate() shells `osascript ... activate`, which is ASYNCHRONOUS: returncode 0 only
             # means the Apple Event was dispatched, not that focus has landed. Checking is_frontmost()
@@ -217,6 +220,22 @@ class RecoveryController:
         geo = self.window.get_geometry()
         return self._match(self.capture.grab_window(geo), det)
 
+    def _confirm_at_lobby_within(self) -> bool:
+        """Poll the lobby anchor over a bounded window instead of checking ONCE immediately. The hub
+        takes a moment to reload after a reconnect/leave, so a single instant check fails before it's
+        visible -> the per-cause budget never resets -> recovery STOPs early on a recovery that actually
+        worked (round 26 #3). Window sized from join_timeout_ms; sleeps go through the clock so panic
+        still interrupts. (With recovery_check_every_ms huge, as in tests, this is a single check.)"""
+        if self.strat.recovery.lobby_anchor is None:
+            return False
+        tries = max(1, self.config.join_timeout_ms // max(1, self.config.recovery_check_every_ms))
+        for n in range(tries):
+            if self._confirm_at_lobby():
+                return True
+            if n + 1 < tries:
+                self.clock.sleep(max(1, self.config.recovery_check_every_ms))
+        return False
+
     def _relaunch_experience(self) -> bool:
         """Hard-disconnect-to-website fallback: re-open the server. Prefers the private-
         server link (so we always land back in the SAME server), then relaunch_url."""
@@ -245,11 +264,11 @@ class RecoveryController:
             pass
         if self.strat.recovery.lobby_anchor is None:
             return False  # cannot confirm -> don't reset the budget
-        if self._confirm_at_lobby():
+        if self._confirm_at_lobby_within():  # poll: the hub isn't visible the instant Enter is pressed
             return True
         # dumped to the Roblox app/website instead of the hub -> relaunch fallback (§8.5)
         if self._relaunch_experience():
-            return self._confirm_at_lobby()
+            return self._confirm_at_lobby_within()
         log.warning("recovery: could not confirm reconnect reached the hub")
         return False
 
@@ -274,7 +293,7 @@ class RecoveryController:
                         "reliable Leave/Reset on your Roblox client version)")
         if self.strat.recovery.lobby_anchor is None:
             return False  # unconfirmable; per-cause cap bounds the retries
-        confirmed = self._confirm_at_lobby()
+        confirmed = self._confirm_at_lobby_within()  # poll: the hub reloads a moment after Leave
         if not confirmed:
             log.warning("recovery: could not confirm we reached the lobby after leave/reset")
         return confirmed

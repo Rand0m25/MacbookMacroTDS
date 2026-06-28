@@ -10,6 +10,15 @@ from tds_macro.errors import StratValidationError
 from tds_macro.geometry import Point
 
 
+def test_load_non_utf8_file_raises_validation_error(tmp_path):
+    # a non-UTF-8 byte must surface as a clean StratValidationError, not an uncaught
+    # UnicodeDecodeError traceback in the CLI (round 26 #5)
+    p = tmp_path / "bad.json"
+    p.write_bytes(b'{"schema_version":1,"header":{"map":"caf\xff"},"events":[]}')
+    with pytest.raises(StratValidationError):
+        S.load(str(p), check_frames=False)
+
+
 def _valid_dict():
     return {
         "schema_version": 1,

@@ -803,6 +803,8 @@ def parse(data: dict, base_dir: str = "", check_frames: bool = True) -> StratFil
                        "leave_reset_sequence", "run_end", "expected_map_check", "recovery"},
                 "strat (top level)", problems)
 
+    # A non-dict header is INTENTIONALLY tolerated (Header.from_dict defaults gracefully) so a malformed
+    # metadata block never blocks playing — see test_bugfixes_round1; not changed (round 26 #6 declined).
     header = Header.from_dict(data.get("header", {}))
     if header.private_server_url and not looks_like_roblox_url(str(header.private_server_url)):
         problems.append("header.private_server_url must be a Roblox link "
@@ -911,6 +913,10 @@ def load(path: str, check_frames: bool = True) -> StratFile:
             data = json.load(f)
         except json.JSONDecodeError as e:
             raise StratValidationError([f"JSON syntax error: {e}"], path=path)
+        except UnicodeDecodeError as e:
+            # a non-UTF-8 byte (e.g. a Latin-1 accent saved by a non-UTF-8 editor) must surface as a
+            # clean validation error, not an uncaught traceback in the CLI (round 26 #5)
+            raise StratValidationError([f"file is not valid UTF-8: {e}"], path=path)
     try:
         return parse(data, base_dir=os.path.dirname(os.path.abspath(path)), check_frames=check_frames)
     except StratValidationError as e:

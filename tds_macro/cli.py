@@ -127,6 +127,23 @@ def _play_exit_code(stats) -> int:
     return 1 if (stats is None or stats.is_failure()) else 0
 
 
+def _window_present(window) -> bool:
+    try:
+        window.get_geometry()
+        return True
+    except Exception:
+        return False
+
+
+def _can_cold_start_launch(config, st, window) -> bool:
+    """True if Roblox isn't running but a private-server link can launch it — so the window-dependent
+    screen-capture permission preflight should be DEFERRED to run() (which launches Roblox) instead of
+    hard-failing 'Screen Recording missing' before the window even exists (round 26 #11)."""
+    link = (getattr(config, "private_server_url", "")
+            or getattr(getattr(st, "header", None), "private_server_url", "") or "").strip()
+    return bool(link) and not _window_present(window)
+
+
 def _check_consent(args) -> bool:
     if getattr(args, "accept_ban_risk", False):
         try:
@@ -296,11 +313,21 @@ def cmd_play(args) -> int:
     prewarm_macos_keyboard()  # main-thread warm-up so the listener thread won't SIGSEGV on macOS 15 (#511/#512)
 
     if permissions.is_macos() and not config.dry_run:
-        try:
-            permissions.require_permissions_or_exit(config, capture=capture, window=window)
-        except PermissionsError as e:
-            print(e)
-            return 3
+        if _can_cold_start_launch(config, st, window):
+            # Roblox isn't up yet but a private-server link can launch it. The screen-capture preflight
+            # needs a window and would otherwise wrongly exit 3 before run() launches the game (round 26
+            # #11). Verify Accessibility now (it needs no window); defer screen-capture to run().
+            if not permissions.check_accessibility(prompt=True):
+                ui.err("Accessibility permission is MISSING — grant it to " + permissions.host_app_hint())
+                return 3
+            ui.info("Roblox window not found; will launch it via the private-server link "
+                    "(screen-capture permission is checked once the window is up).")
+        else:
+            try:
+                permissions.require_permissions_or_exit(config, capture=capture, window=window)
+            except PermissionsError as e:
+                print(e)
+                return 3
 
     hk = HotkeyManager(config)
     clock = RealClock(should_abort=hk.should_abort)

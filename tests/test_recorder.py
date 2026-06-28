@@ -55,6 +55,19 @@ def test_double_click_merge_and_pre_move_dropped():
     assert evs[0].clicks == 2
 
 
+def test_rapid_spam_clicks_not_collapsed_to_one():
+    # 5 rapid clicks at one spot must NOT all merge into a single double-click; only one pair
+    # coalesces, so all 5 clicks survive (e.g. [2, 2, 1]) — round 26 #9.
+    c = EventCoalescer(dead_zone=0.01, double_click_ms=250)
+    t = 0
+    for _ in range(5):
+        c.on_button(Point(0.5, 0.5), "left", True, t)
+        c.on_button(Point(0.5, 0.5), "left", False, t + 10)
+        t += 130  # < double_click_ms apart, same spot
+    clicks = [e.clicks for e in c.finish() if e.type == "click"]
+    assert sum(clicks) == 5  # all 5 preserved, not collapsed to one clicks=2
+
+
 def test_two_far_clicks_not_merged():
     c = EventCoalescer(dead_zone=0.01, double_click_ms=250)
     c.on_button(Point(0.2, 0.2), "left", True, 0)

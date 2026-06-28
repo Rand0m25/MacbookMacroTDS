@@ -51,6 +51,27 @@ def test_masking_restores_score():  # S1
     assert masked > no_mask
 
 
+def test_mask_excludes_not_zeroes_so_wrong_unmasked_screen_stays_low():
+    # The masked (top 80%) region is volatile/different; the UNMASKED bottom genuinely differs (50 vs
+    # 200). Excluding the mask (not zeroing it) must keep the score LOW — the old zeroing made both
+    # frames agree on the big masked region and inflated NCC toward a false match (round 26 #10).
+    W = 40
+    rng = np.random.default_rng(1)
+    top_ref, top_live = rng.integers(0, 256, (32, W)), rng.integers(0, 256, (32, W))
+    ref = np.vstack([top_ref, np.full((8, W), 50)])
+    live = np.vstack([top_live, np.full((8, W), 200)])
+    G = lambda a: _frame(np.repeat(a[:, :, None], 3, axis=2))  # noqa: E731
+    c = NumpyComparator()
+    score = c.score(G(live), G(ref), MatchMethod.TM_CCOEFF_NORMED, mask=[Rect(0, 0, 1.0, 0.8)])
+    assert score < 0.9  # only the differing bottom is compared -> not a match
+
+
+def test_full_mask_is_not_a_match():
+    a = _rand(20, 20, 5)
+    c = NumpyComparator()
+    assert c.score(_frame(a), _frame(a), MatchMethod.TM_CCOEFF_NORMED, mask=[Rect(0, 0, 1, 1)]) == 0.0
+
+
 @pytest.mark.parametrize("method", list(MatchMethod))
 def test_identical_scores_high_all_methods(method):
     a = _rand(32, 32, 7)

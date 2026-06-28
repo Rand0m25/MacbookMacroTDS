@@ -103,7 +103,8 @@ class EventCoalescer:
     def _buffer_click(self, pos: Point, button: str, t: int) -> None:  # under self._lock
         pc = self._pending_click
         if (pc is not None and pc["button"] == button
-                and (t - pc["t"]) <= self.double_click_ms
+                and pc["clicks"] < 2  # only ONE pair coalesces; a 3rd rapid click starts a new event
+                and (t - pc["t"]) <= self.double_click_ms  # (else N spam clicks collapse to one double-click)
                 and _dist(pos, pc["pos"]) <= self.dead_zone):
             pc["clicks"] = min(2, pc["clicks"] + 1)
             pc["t"] = t

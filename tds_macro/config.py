@@ -177,6 +177,8 @@ class Config:
                 raise ValueError("window_rect_override must be a list of 4 numbers [x, y, w, h]")
             return tuple(int(x) for x in value)
         if key == "retina_scale_override" and value is not None:
+            if isinstance(value, bool):  # bool is an int subclass; reject it like every other numeric field
+                raise ValueError("retina_scale_override must be a number")
             f = float(value)  # raises ValueError/TypeError on bad input (caught by CLI)
             if not math.isfinite(f):
                 raise ValueError("retina_scale_override must be a finite number")
@@ -274,6 +276,13 @@ class Config:
             problems.append("localize_margin must be >= 0")
         if self.localize_max_jumps < 0:
             problems.append("localize_max_jumps must be >= 0")
+        # Reject an incoherent real/mock mix (e.g. a strat's config_overrides flipping window_backend to
+        # "mock" on a real run): a mock window reports frontmost=True with fake 1600x900 geometry, which
+        # neutralizes the focus guard and fires REAL clicks at arbitrary screen points (round 26 #7).
+        if ((self.window_backend == WindowBackendKind.MOCK or self.screen_backend == ScreenBackendKind.MOCK)
+                and self.input_backend != InputBackendKind.MOCK):
+            problems.append("incoherent backends: a mock window/screen backend with a real input backend "
+                            "would fire real input against fake geometry")
         return problems
 
     def min_sync_timeout_ms(self) -> int:

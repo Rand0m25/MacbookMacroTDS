@@ -444,11 +444,16 @@ class Player:
         # resume mid-run starts in the right place instead of replaying from the top. Declining keeps i=0,
         # so a normal fresh start still plays the (un-anchored) opening.
         if (localize and self.config.localize_on_start and sync_idxs and not self.config.dry_run):
+            scan_start = self.clock.now_ms()
             j = self._localize_against_syncs(prims, sync_idxs, expected_i=None, live=None)
             if j is not None:
                 i = j  # land ON the matched sync so its full barrier re-confirms before any input fires
                 self._reanchor_to(prims[j].t_ms)
                 log.info("localize: starting at sync %r (index %d)", prims[j].label, j)
+            else:
+                # the scan itself burned wall time; absorb it so the opening events keep their recorded
+                # spacing instead of firing in a back-to-back burst at loop start (round 26 #2)
+                self._absorb_wall_time(scan_start)
 
         while i < len(prims):
             e = prims[i]
@@ -469,6 +474,7 @@ class Player:
             if isinstance(e, SyncPointEvent):
                 jumped = False
                 attempts = 0
+                focus_retries = 0
                 while True:
                     result, live = self._adaptive_wait(e)
                     if result == WaitResult.FIRE:
@@ -503,7 +509,12 @@ class Player:
                             jumped = True
                             log.info("localize: resynced %r -> %r after timeout", e.label, prims[j].label)
                             break
-                    self._handle_sync_timeout(e)  # escalate (abort/continue/recover)
+                    if self._handle_sync_timeout(e):  # focus-only repair -> re-confirm, don't skip the gate
+                        if focus_retries < self.config.sync_max_retries:
+                            focus_retries += 1
+                            continue  # re-run the barrier now that focus is back
+                        # focus kept flapping -> treat as a genuinely stuck sync (restart), never advance blind
+                        self._route_recovery(FailureMode.STUCK_SYNC)  # raises _RestartLoop/_StopRun
                     break
                 if jumped:
                     continue  # i already advanced to the jump target; don't increment past it
@@ -516,12 +527,16 @@ class Player:
             self._dispatch_primitive(e)
             i += 1
 
-    def _handle_sync_timeout(self, sync: SyncPointEvent) -> None:
+    def _handle_sync_timeout(self, sync: SyncPointEvent) -> bool:
+        """Escalate a timed-out sync. Returns True ONLY when the timeout was repaired by a focus-only
+        RESUME (the visual checkpoint was never confirmed) so the caller re-runs the barrier instead of
+        advancing past it; every other outcome either returns False (advance, e.g. on_timeout='continue')
+        or raises (_StopRun / _RestartLoop / _RunComplete)."""
         action = sync.on_timeout
         log.info("sync '%s' timed out -> %s", sync.label, action)
         if action == "continue":
             self._rebase_clock(sync.t_ms)  # absorb the elapsed timeout so later events keep spacing
-            return
+            return False
         if action == "abort":
             raise _StopRun(f"sync '{sync.label}' timed out (on_timeout=abort)")
         # "recover" / retry-exhausted: absorb the elapsed timeout (mirror 'continue') so a
@@ -542,7 +557,11 @@ class Player:
                 raise _RunComplete(fm)
             if fm == FailureMode.NONE:
                 fm = FailureMode.STUCK_SYNC
-        self._route_recovery(fm)
+        self._route_recovery(fm)  # raises for REJOIN/STOP; returns only on a FOCUS_LOST RESUME
+        # A focus-only repair is the ONE non-raising outcome: the game state behind the barrier was
+        # never actually confirmed, so signal the caller to re-run the barrier rather than fire the
+        # next input blind on an unconfirmed checkpoint (round 26 #1).
+        return fm == FailureMode.FOCUS_LOST
 
     # --- run-end detection (M15) -----------------------------------------
     def _match_run_end(self, window) -> Optional[FailureMode]:

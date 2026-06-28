@@ -6,11 +6,66 @@ from tds_macro.input_backend import MockInputBackend
 from tds_macro.hotkeys import HotkeyManager, HotkeyEvents
 from tds_macro.recovery import MockRecoveryController, Outcome, FailureMode
 from tds_macro.window import MockWindowProvider
-from tds_macro.engine import RunState
+from tds_macro.engine import RunState, _RestartLoop
+from tds_macro.frame import Frame
 from tds_macro import strat as S
 from tds_macro.geometry import Point
 
+import pytest
+
 from helpers import build_player, mock_config, mk_sync
+
+
+# --- round 26 #1: a sync timeout repaired by focus-only recovery must RE-CONFIRM, not skip the gate ---
+def test_focus_lost_sync_timeout_reconfirms_then_escalates():
+    # sync never matches (ROI stays wrong); classify returns FOCUS_LOST first (recovery RESUMEs), then
+    # NONE -> STUCK_SYNC -> REJOIN. The engine must NOT advance past the sync to dispatch the key.
+    calls = {"n": 0}
+
+    def classify_fn(frame):
+        calls["n"] += 1
+        return FailureMode.FOCUS_LOST if calls["n"] == 1 else FailureMode.NONE
+
+    def handle_fn(reason, scene):
+        return Outcome.RESUME if reason == FailureMode.FOCUS_LOST else Outcome.REJOIN
+
+    rec = MockRecoveryController(handle_fn=handle_fn, classify_fn=classify_fn)
+    events = [mk_sync(1, 0, "s1", on_timeout="recover", timeout=200),
+              S.KeyPressEvent(2, 50, "key_press", key="a")]
+    p, inp, _, _ = build_player(S.StratFile(base_dir=".", events=events), recovery=rec,
+                                cfg=mock_config(sync_poll_ms=10), capture=MockCaptureBackend(current_label="nomatch"))
+    with pytest.raises(_RestartLoop):  # re-confirm failed -> restart, rather than firing 'a' blind
+        p._play_sequence(events, RunState.IN_MATCH, localize=True)
+    assert not any(e["action"] == "key_press" for e in inp.events)  # the gated input never fired
+
+
+# --- round 26 #2: a localize_on_start DECLINE must absorb the scan time so opening spacing is kept ---
+class _TimedInput(MockInputBackend):
+    def __init__(self, clock):
+        super().__init__()
+        self.clock = clock
+        self.key_times = {}
+
+    def press_key(self, key, modifiers=()):
+        super().press_key(key, modifiers)
+        self.key_times[key] = self.clock.now_ms()
+
+
+def test_localize_on_start_decline_preserves_opening_spacing():
+    clock = FakeClock()
+
+    def frame_fn(geo, region):
+        clock.sleep(40)  # the localizer's grab+score scan burns wall time
+        return Frame.labelled("nomatch")  # matches no checkpoint -> Hook A declines
+    inp = _TimedInput(clock)
+    events = [S.KeyPressEvent(1, 0, "key_press", key="a"),
+              S.KeyPressEvent(2, 100, "key_press", key="b"),
+              mk_sync(3, 10000, "s1", on_timeout="continue")]
+    p, _, _, _ = build_player(S.StratFile(base_dir=".", events=events),
+                              cfg=mock_config(localize_on_start=True),
+                              capture=MockCaptureBackend(frame_fn=frame_fn), clock=clock, input_backend=inp)
+    p._play_sequence(events, RunState.IN_MATCH, localize=True)
+    assert inp.key_times["b"] - inp.key_times["a"] == 100  # recorded 100ms gap preserved after the scan
 
 
 # --- RunStats.is_failure(): zero-match failures vs benign/successful stops ----------------

@@ -29,6 +29,30 @@ def test_classify_detects_disconnect():
     assert rc.classify(None) == FailureMode.STUCK_SYNC
 
 
+def test_focus_lost_does_not_activate_in_dry_run():  # round 26 #4
+    win = MockWindowProvider(frontmost=False)
+    rc = _controller(window=win, cfg=mock_config(dry_run=True))
+    assert rc.handle(FailureMode.FOCUS_LOST) == Outcome.RESUME
+    assert win.activate_calls == 0  # a preview must not yank focus to Roblox
+
+
+def test_reconnect_confirms_lobby_after_a_delay():  # round 26 #3
+    # the hub becomes visible only after a couple of polls; the bounded confirm window must catch it
+    # (a single immediate check would miss it -> per-cause budget never resets -> premature STOP).
+    st = S.StratFile(events=[], base_dir=".", recovery=S.RecoverySpec(
+        disconnect=S.DetectorSpec("dc.png", Rect(0, 0, 1, 1), 0.9),
+        lobby_anchor=S.DetectorSpec("hub.png", Rect(0, 0, 1, 1), 0.9)))
+    calls = {"n": 0}
+
+    def frame_fn(geo, region):
+        calls["n"] += 1
+        return Frame.labelled("hub.png" if calls["n"] >= 3 else "loading")  # hub appears on the 3rd grab
+    rc = RecoveryController(st, MockWindowProvider(), MockInputBackend(), MockCaptureBackend(frame_fn=frame_fn),
+                            MockComparator(), FakeClock(), mock_config(join_timeout_ms=1000, recovery_check_every_ms=10))
+    assert rc.handle(FailureMode.DISCONNECTED) == Outcome.REJOIN
+    assert rc.attempts.get("disconnected", 0) == 0  # confirmed reach of the hub -> per-cause counter reset
+
+
 def test_handle_is_total_over_failure_modes():  # M4
     rc = _controller(cfg=mock_config(max_attempts_per_cause=99))
     for fm in FailureMode:

@@ -74,17 +74,30 @@ class NumpyComparator:
         # Canonical geometry = reference dims (M3): resize live to match ref.
         out_h, out_w = b.shape[0], b.shape[1]
         a = _resize_gray(np, a, out_h, out_w)
+        m = MatchMethod(method)
+        # Pixel-statistical metrics: EXCLUDE masked pixels from the stats. Zeroing them (the old behavior)
+        # made BOTH frames agree on the masked region and inflated the score toward a false match — a mask
+        # over a volatile area could push a clearly-wrong screen above threshold (round 26 #10).
+        if m in (MatchMethod.TM_CCOEFF_NORMED, MatchMethod.NCC,
+                 MatchMethod.TM_SQDIFF_NORMED, MatchMethod.MSE):
+            if mask:
+                keep = _keep_mask(np, (out_h, out_w), mask)
+                if not keep.any():
+                    return 0.0  # the mask covers everything -> nothing left to compare -> not a match
+                av, bv = a[keep], b[keep]
+            else:
+                av, bv = a, b
+            if m == MatchMethod.TM_SQDIFF_NORMED:
+                return _sqdiff_sim(np, av, bv)
+            if m == MatchMethod.MSE:
+                mse = float(((av - bv) ** 2).mean())
+                return max(0.0, 1.0 - mse / (255.0 ** 2))
+            return _ncc(np, av, bv)
+        # Structural metrics (SSIM/pHash, non-default): they need 2D structure, so keep the prior
+        # zero-out-the-region behavior for them.
         if mask:
             _apply_mask(np, a, mask)
             _apply_mask(np, b, mask)
-        m = MatchMethod(method)
-        if m in (MatchMethod.TM_CCOEFF_NORMED, MatchMethod.NCC):
-            return _ncc(np, a, b)
-        if m == MatchMethod.TM_SQDIFF_NORMED:
-            return _sqdiff_sim(np, a, b)
-        if m == MatchMethod.MSE:
-            mse = float(((a - b) ** 2).mean())
-            return max(0.0, 1.0 - mse / (255.0 ** 2))
         if m == MatchMethod.SSIM:
             return _ssim(np, a, b)
         if m == MatchMethod.PHASH:
@@ -120,6 +133,20 @@ def _apply_mask(np, gray, mask: list[Rect]) -> None:
         x1 = max(x0, min(round((r.x + r.w) * w), w))
         y1 = max(y0, min(round((r.y + r.h) * h), h))
         gray[y0:y1, x0:x1] = 0.0
+
+
+def _keep_mask(np, shape, mask: list[Rect]):
+    """Boolean array (True = KEEP) with each mask rect cleared — so pixel-statistical metrics can
+    EXCLUDE the masked (volatile) regions instead of zeroing them. Same rounding as _apply_mask."""
+    h, w = shape
+    keep = np.ones((h, w), dtype=bool)
+    for r in mask:
+        x0 = max(0, min(round(r.x * w), w))
+        y0 = max(0, min(round(r.y * h), h))
+        x1 = max(x0, min(round((r.x + r.w) * w), w))
+        y1 = max(y0, min(round((r.y + r.h) * h), h))
+        keep[y0:y1, x0:x1] = False
+    return keep
 
 
 def _ncc(np, a, b) -> float:
