@@ -290,3 +290,42 @@ def test_center_cursor_noop_in_dry_run():
     p, inp, _, _ = build_player(st, cfg=mock_config(loop_count=1, center_cursor_on_play=True, dry_run=True))
     p.run()
     assert inp.events == []
+
+
+# --- match the live window to the recorded size before play (so screen-position clicks land right) ---
+def _sized_strat():
+    hdr = S.Header(window_aspect=round(1137 / 693, 6),
+                   reference_resolution={"w": 1137, "h": 693}, retina_scale_captured_at=1.0)
+    return S.StratFile(base_dir=".", header=hdr, events=_keys((0, "a")))
+
+
+def test_window_resized_to_recorded_size_on_aspect_mismatch():
+    win = MockWindowProvider(rect=(0, 0, 1600, 900))  # aspect 1.78 != recorded 1.64 -> resize
+    p, _, _, _ = build_player(_sized_strat(), window=win,
+                              cfg=mock_config(loop_count=1, match_window_size_on_play=True))
+    p.run()
+    assert win.rect == (0, 0, 1137, 693)
+
+
+def test_window_not_resized_when_aspect_matches():
+    win = MockWindowProvider(rect=(0, 0, 2274, 1386))  # 2x size but SAME aspect -> leave it alone
+    p, _, _, _ = build_player(_sized_strat(), window=win,
+                              cfg=mock_config(loop_count=1, match_window_size_on_play=True))
+    p.run()
+    assert win.rect == (0, 0, 2274, 1386)
+
+
+def test_window_not_resized_when_disabled():
+    win = MockWindowProvider(rect=(0, 0, 1600, 900))
+    p, _, _, _ = build_player(_sized_strat(), window=win,
+                              cfg=mock_config(loop_count=1, match_window_size_on_play=False))
+    p.run()
+    assert win.rect == (0, 0, 1600, 900)
+
+
+def test_window_not_resized_in_dry_run():
+    win = MockWindowProvider(rect=(0, 0, 1600, 900))
+    p, _, _, _ = build_player(_sized_strat(), window=win,
+                              cfg=mock_config(loop_count=1, match_window_size_on_play=True, dry_run=True))
+    p.run()
+    assert win.rect == (0, 0, 1600, 900)

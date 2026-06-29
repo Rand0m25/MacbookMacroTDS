@@ -150,6 +150,11 @@ class Config:
     verify_foreground: bool = True  # validate Roblox is frontmost right before every input primitive,
     #                                 so a click/keypress can never land in another app (else focus is
     #                                 only checked every recovery_check_every_ms and input fires blind)
+    match_window_size_on_play: bool = True  # before playback, if the live Roblox window's ASPECT differs
+    #                                          from the recorded one, resize it to the recorded size so
+    #                                          screen-position clicks (tower placement) land on the same
+    #                                          spot. No-op when the aspect already matches (normalized
+    #                                          coords handle a same-aspect size change) or in dry-run.
     center_cursor_on_play: bool = True  # before playback starts, move the cursor to the middle of the
     #                                     Roblox window so the first recorded action begins from inside the
     #                                     game (a cursor left in another app/monitor can make an opening

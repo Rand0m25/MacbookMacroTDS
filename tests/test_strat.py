@@ -119,3 +119,20 @@ def test_missing_frame_is_caught(tmp_path):
     with pytest.raises(StratValidationError) as ei:
         S.load(path, check_frames=True)
     assert any("not found" in p for p in ei.value.problems)
+
+
+# --- Header.recorded_logical_size (drives match_window_size_on_play) ---
+def test_recorded_logical_size_divides_out_retina():
+    h = S.Header(reference_resolution={"w": 2274, "h": 1386}, retina_scale_captured_at=2.0)
+    assert h.recorded_logical_size() == (1137, 693)  # physical / retina = logical points
+
+
+def test_recorded_logical_size_retina_one():
+    h = S.Header(reference_resolution={"w": 1137, "h": 693}, retina_scale_captured_at=1.0)
+    assert h.recorded_logical_size() == (1137, 693)
+
+
+def test_recorded_logical_size_unknown_returns_none():
+    assert S.Header().recorded_logical_size() is None
+    assert S.Header(reference_resolution={"w": 0, "h": 0}).recorded_logical_size() is None
+    assert S.Header(reference_resolution={"w": "bad", "h": 5}).recorded_logical_size() is None

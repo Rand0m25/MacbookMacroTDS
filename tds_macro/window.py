@@ -23,6 +23,7 @@ class WindowProvider(Protocol):
     def get_geometry(self) -> WindowGeometry: ...
     def is_frontmost(self) -> bool: ...
     def activate(self) -> None: ...
+    def set_geometry(self, w: int, h: int) -> bool: ...
 
 
 class MockWindowProvider:
@@ -51,6 +52,11 @@ class MockWindowProvider:
     def activate(self) -> None:
         self.activate_calls += 1
         self.frontmost = True
+
+    def set_geometry(self, w: int, h: int) -> bool:
+        x, y, _, _ = self.rect
+        self.rect = (x, y, int(w), int(h))
+        return True
 
 
 class QuartzWindowProvider:
@@ -168,6 +174,31 @@ class QuartzWindowProvider:
                 continue
         log.warning("could not activate the Roblox window via osascript (tried %s)", candidates)
 
+    def set_geometry(self, w: int, h: int) -> bool:
+        """Resize the Roblox window to ``w``x``h`` LOGICAL points (position unchanged) via System
+        Events, so replay happens at the same window size the strat was recorded at and screen-position
+        clicks land correctly. Best-effort: returns True only if an osascript actually succeeded.
+        Requires Accessibility permission (already needed for input). The window may snap to its own
+        min/max — the caller re-reads geometry and warns if the aspect still differs."""
+        import subprocess
+
+        candidates = list(dict.fromkeys([*self._owner_names, *self.OWNER_NAMES]))
+        for name in candidates:
+            # same AppleScript-literal escaping as activate(): window_title_match may come from an
+            # untrusted strat's config_overrides (round 22 #L). validate() already rejects newlines.
+            safe = name.replace("\\", "\\\\").replace('"', '\\"')
+            script = (f'tell application "System Events" to tell process "{safe}" '
+                      f"to set size of front window to {{{int(w)}, {int(h)}}}")
+            try:
+                proc = subprocess.run(["osascript", "-e", script],
+                                      check=False, capture_output=True, timeout=3)
+                if proc.returncode == 0:
+                    return True
+            except Exception:
+                continue
+        log.warning("could not resize the Roblox window via System Events (tried %s)", candidates)
+        return False
+
 
 class _GeometryOverrideProvider:
     """Pins geometry to an override rect (the --window-rect / test flag) but delegates is_frontmost()
@@ -187,6 +218,9 @@ class _GeometryOverrideProvider:
 
     def activate(self) -> None:
         self._real.activate()
+
+    def set_geometry(self, w: int, h: int) -> bool:
+        return self._geo.set_geometry(w, h)  # update the pinned override rect (keeps geometry coherent)
 
 
 def make_window_provider(config: Config) -> WindowProvider:

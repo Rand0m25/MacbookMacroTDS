@@ -613,9 +613,34 @@ class Player:
         return mode if mode is not None else FailureMode.NONE
 
     # --- top-level run loop ----------------------------------------------
+    def _match_window_size(self) -> None:
+        """Resize the live Roblox window back to the size the strat was recorded at, so screen-position
+        clicks (tower placement) land on the same spot. Only acts when the live ASPECT differs from the
+        recorded one — a same-aspect size change needs no resize (normalized coords handle it), so we don't
+        disturb the window needlessly. Skipped in dry-run / when disabled / when the recorded size is
+        unknown. Best-effort: any failure is swallowed and _arm()'s aspect check still warns."""
+        if not self.config.match_window_size_on_play or self.config.dry_run:
+            return
+        size = self.strat.header.recorded_logical_size()
+        if not size:
+            return
+        from .geometry import aspect_mismatch
+
+        ha = self.strat.header.window_aspect
+        if ha and not aspect_mismatch(self._geo, ha, self.config.aspect_warn_tolerance):
+            return  # aspect already matches -> clicks land right at any size; leave the window alone
+        rw, rh = size
+        try:
+            if self.window.set_geometry(rw, rh):
+                self._refresh_geo()
+                log.info("matched Roblox window to recorded size %dx%d (live aspect differed)", rw, rh)
+        except Exception:  # noqa: BLE001 - resizing is a convenience, never fatal
+            log.debug("match-window-size skipped", exc_info=True)
+
     def _arm(self) -> None:
         self.state = RunState.ARMING
         self._refresh_geo()
+        self._match_window_size()  # resize to the recorded size if the live aspect differs (best-effort)
         from .geometry import aspect_mismatch
 
         ha = self.strat.header.window_aspect

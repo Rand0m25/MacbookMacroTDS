@@ -190,6 +190,14 @@ move), the macro verifies the **Roblox window is frontmost**, so an action can n
 another app if you alt-tab away. If focus is lost it refocuses Roblox first (bounded, then
 stops); it never fires blind. Opt out with `config_overrides: {"verify_foreground": false}`.
 
+**Match the recorded window size.** Tower placement is a click at a screen position, so if the Roblox
+window is a different *aspect* at replay than when you recorded, those clicks land on the wrong tile.
+Before playback the macro **resizes the Roblox window back to the size the strat was recorded at**
+whenever the live aspect differs (toggle: `match_window_size_on_play`, default on; it leaves the window
+alone when the aspect already matches, since a same-aspect size change is handled by the normalized
+coordinates). Best-effort via System Events (needs the Accessibility permission you already grant); if
+it can't resize, it falls back to the aspect-mismatch warning.
+
 **Cursor placement.** Before playback starts, the macro moves the cursor into the **middle of the
 Roblox window** so the first action begins from inside the game (toggle: `center_cursor_on_play`,
 default on). And during a visual-sync wait the cursor is now **left where it is** instead of being

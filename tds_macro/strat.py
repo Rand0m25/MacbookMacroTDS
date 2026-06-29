@@ -700,6 +700,22 @@ class Header:
             h.reference_resolution = {}
         return h
 
+    def recorded_logical_size(self) -> Optional[tuple[int, int]]:
+        """The window size (in logical points) the strat was recorded at, or None if unknown.
+        reference_resolution is stored in PHYSICAL pixels, so divide by the captured Retina scale to
+        recover logical points — the space window geometry / clicks live in. Used to resize the live
+        Roblox window back to the recorded size before play so screen-position clicks (tower placement)
+        land on the same spot."""
+        rr = self.reference_resolution or {}
+        try:
+            pw, ph = float(rr.get("w", 0)), float(rr.get("h", 0))
+            ret = float(self.retina_scale_captured_at or 1.0)
+        except (TypeError, ValueError):
+            return None
+        if pw > 0 and ph > 0 and ret > 0:
+            return (round(pw / ret), round(ph / ret))
+        return None
+
 
 def _detector(d, name, ctx, problems) -> Optional[DetectorSpec]:
     if d is None:
