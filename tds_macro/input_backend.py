@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import threading
 import logging
+import sys
 import time
 from typing import Protocol
 
@@ -84,6 +85,14 @@ _SPECIAL_NAMES = (
 ).split()
 
 
+# macOS virtual keycodes for the NUMBER ROW (kVK_ANSI_1..0). Used to force the number-row key for plain
+# digits, since pynput's char->keycode map on macOS can resolve "1".."0" to the NUMERIC KEYPAD instead.
+_MACOS_NUMBER_ROW_VK = {
+    "1": 0x12, "2": 0x13, "3": 0x14, "4": 0x15, "5": 0x17,
+    "6": 0x16, "7": 0x1A, "8": 0x1C, "9": 0x19, "0": 0x1D,
+}
+
+
 def key_to_pynput(name: str):
     from pynput.keyboard import Key, KeyCode  # type: ignore
 
@@ -92,6 +101,14 @@ def key_to_pynput(name: str):
     if name.startswith("vk:"):  # lossless round-trip of vk-only keys
         try:
             return KeyCode.from_vk(int(name[3:]))
+        except (ValueError, AttributeError):
+            pass
+    if sys.platform == "darwin" and name in _MACOS_NUMBER_ROW_VK:
+        # On macOS pynput's unicode->keycode map resolves the digit CHARACTERS to the NUMERIC KEYPAD
+        # keycodes, so a game bound to the number ROW (e.g. the TDS tower hotbar 1-9) ignores them and
+        # the tower is never selected. Force the number-row virtual keycode instead (observed bug).
+        try:
+            return KeyCode.from_vk(_MACOS_NUMBER_ROW_VK[name])
         except (ValueError, AttributeError):
             pass
     if len(name) == 1:
