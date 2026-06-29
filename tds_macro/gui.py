@@ -439,6 +439,14 @@ class GuiController:
             except Exception as e:
                 self._emit("error", f"could not start: {e}")
                 return False
+            # Namespace captured reference frames by record target so recording a join/leave sequence
+            # into an EXISTING strat can't overwrite the main timeline's sync_N.png on disk (the JSON
+            # merge keeps the main events pointing at frames/sync_1.png; a shared filename would clobber
+            # its pixels and make that sync compare against the wrong image forever).
+            try:
+                recorder.sync_label_prefix = "sync" if target == "events" else f"{target}_sync"
+            except (AttributeError, TypeError):
+                pass  # an injected recorder that doesn't support it just keeps its own naming
             header = self._make_header(name, map, difficulty)
             save_strat = self.deps.save_strat
 

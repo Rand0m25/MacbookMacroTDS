@@ -399,6 +399,17 @@ def test_start_record_rejects_unknown_target():
     assert not ctrl.is_busy() and any(k == "error" for k, _ in events)
 
 
+def test_record_target_namespaces_sync_frame_prefix():
+    # the controller must tell the recorder a target-specific frame-label prefix, so a join/leave
+    # recording's captured PNGs can't overwrite the main timeline's sync_N.png (recorder.capture_sync_point)
+    for target, prefix in (("events", "sync"), ("join", "join_sync"), ("leave", "leave_sync")):
+        recorded = [S.KeyPressEvent(1, 0, "key_press", key="a")]
+        ctrl, h, events, box = _record_target_setup(
+            recorded, load_strat_lenient=lambda p: S.StratFile(base_dir="."))
+        _run_record(ctrl, box, "m.strat.json", target=target)
+        assert box["rec"].sync_label_prefix == prefix
+
+
 # -- Settings (persisted Config-override subset) --
 def test_settings_load_into_effective():
     ctrl, _, _ = _setup(load_settings=lambda: {"jitter_ms": 99},

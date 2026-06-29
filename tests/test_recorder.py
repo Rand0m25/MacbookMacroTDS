@@ -116,3 +116,48 @@ def test_events_have_monotonic_ids_and_sorted_time():
     evs = c.finish()
     assert [e.t_ms for e in evs] == sorted(e.t_ms for e in evs)
     assert len({e.id for e in evs}) == len(evs)
+
+
+def test_capture_sync_point_honors_label_prefix(tmp_path, monkeypatch):
+    # a join/leave recording sets a target-specific prefix so its frames are named join_sync_N / leave_sync_N
+    import os
+    import tds_macro.pngio as pngio
+    written = []
+    monkeypatch.setattr(pngio, "frame_to_rgba_bytes", lambda f: (b"\x00\x00\x00\x00", 1, 1))
+    monkeypatch.setattr(pngio, "write_png", lambda path, *a, **k: written.append(os.path.abspath(path)))
+    rec = Recorder(MockWindowProvider(rect=(0, 0, 1000, 1000), frontmost=True), MockInputBackend(),
+                   MockCaptureBackend(), mock_config(), HotkeyManager(mock_config(), HotkeyEvents()),
+                   clock=FakeClock())
+    rec._strat_dir = str(tmp_path)
+    rec._refresh_geo()
+    rec.sync_label_prefix = "join_sync"
+    sp = rec.capture_sync_point()
+    assert sp.label == "join_sync_1"
+    assert sp.ref_frame == os.path.join("frames", "join_sync_1.png")
+    assert written and written[0].endswith(os.path.join("frames", "join_sync_1.png"))
+
+
+def test_join_recording_frames_do_not_overwrite_main_timeline_frames(tmp_path, monkeypatch):
+    # Repro of the cross-target collision: recording the main timeline writes frames/sync_1.png; a later
+    # join recording into the SAME strat dir must write a DIFFERENT file, or it clobbers the main
+    # timeline's reference image (its sync would then compare against the lobby forever).
+    import os
+    import tds_macro.pngio as pngio
+    written = []
+    monkeypatch.setattr(pngio, "frame_to_rgba_bytes", lambda f: (b"\x00\x00\x00\x00", 1, 1))
+    monkeypatch.setattr(pngio, "write_png", lambda path, *a, **k: written.append(os.path.abspath(path)))
+
+    def mk(prefix):
+        r = Recorder(MockWindowProvider(rect=(0, 0, 1000, 1000), frontmost=True), MockInputBackend(),
+                     MockCaptureBackend(), mock_config(), HotkeyManager(mock_config(), HotkeyEvents()),
+                     clock=FakeClock())
+        r._strat_dir = str(tmp_path)
+        r._refresh_geo()
+        r.sync_label_prefix = prefix
+        return r
+
+    sp_main = mk("sync").capture_sync_point()          # main timeline (default prefix)
+    sp_join = mk("join_sync").capture_sync_point()      # join sequence into the same strat
+    assert sp_main.ref_frame == os.path.join("frames", "sync_1.png")
+    assert sp_join.ref_frame == os.path.join("frames", "join_sync_1.png")
+    assert written[0] != written[1]  # distinct files -> the main timeline's frame is never clobbered

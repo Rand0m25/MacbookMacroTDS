@@ -156,6 +156,11 @@ class Recorder:
         # RealClock right after start), and `if not self._t0` would wrongly re-seed it (round 19 #2).
         self._t0: Optional[float] = None
         self._sync_default_region = Rect(0.0, 0.0, 1.0, 1.0)
+        # Prefix for auto-generated sync-frame filenames (sync_1.png, ...). The GUI sets a target-specific
+        # prefix ("join_sync"/"leave_sync") when recording a join/leave sequence INTO an existing strat, so
+        # those captures can't overwrite the main timeline's sync_N.png on disk — the JSON merge keeps the
+        # main events pointing at frames/sync_1.png, but a shared filename would clobber its pixels.
+        self.sync_label_prefix = "sync"
         dz_px = 6
         self.coalescer = EventCoalescer(double_click_ms=config.double_click_ms)
         self._dz_px = dz_px
@@ -268,7 +273,7 @@ class Recorder:
             self._t0 = (self.clock.now_ms() if self.clock else time.monotonic() * 1000)
         region = region or self._sync_default_region
         self._sync_count += 1
-        label = label or f"sync_{self._sync_count}"
+        label = label or f"{self.sync_label_prefix}_{self._sync_count}"
         frame = self.capture.grab_region(self._geo, region)
         rel = os.path.join(self.config.frames_dir, f"{label}.png")
         abspath = os.path.join(self._strat_dir, rel)
