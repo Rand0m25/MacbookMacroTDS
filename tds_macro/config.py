@@ -99,6 +99,9 @@ class Config:
     mouse_move_hz: int = 120
     default_click_hold_ms: int = 25
     double_click_ms: int = 250
+    humanize: bool = True  # master switch for the two random perturbations below (jitter_ms +
+    #                        click_offset_px). Off -> exact replay (no random timing/position), even if
+    #                        the values below are non-zero. With them at 0 it makes no difference.
     jitter_ms: int = 0  # +/- random timing jitter at playback (humanization)
     click_offset_px: int = 0  # +/- random per-click pixel offset (humanization)
     min_inter_event_ms: int = 8  # floor between injected events (R10)
@@ -274,6 +277,12 @@ class Config:
         if self.relaunch_url and not looks_like_roblox_url(self.relaunch_url):
             # same OS-`open` gate as private_server_url — it's the recovery relaunch fallback (round 22 #B)
             problems.append("relaunch_url must be a Roblox link (https://...roblox.com... or roblox://...)")
+        for hk in ("panic_hotkey", "start_hotkey", "pause_hotkey", "mark_sync_hotkey"):
+            v = getattr(self, hk)
+            if not isinstance(v, str) or not v.strip():
+                # an empty/blank hotkey is silently SKIPPED by HotkeyManager.start(); for panic_hotkey
+                # that means the F8 kill-switch is gone with no visible warning. Reject it up front.
+                problems.append(f"{hk} must be a non-empty key name (e.g. f8)")
         if any(c in self.window_title_match for c in '"\\\n\r'):
             # window_title_match is interpolated into an osascript program in window.activate();
             # quotes/backslashes/newlines could inject AppleScript from an untrusted strat (round 22 #L)

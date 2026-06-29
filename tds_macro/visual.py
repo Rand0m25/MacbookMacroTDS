@@ -96,6 +96,10 @@ class NumpyComparator:
         # Structural metrics (SSIM/pHash, non-default): they need 2D structure, so keep the prior
         # zero-out-the-region behavior for them.
         if mask:
+            if not _keep_mask(np, (out_h, out_w), mask).any():
+                # a mask covering the whole region zeroes BOTH frames -> SSIM/pHash of two all-zero
+                # arrays = 1.0, a false match on ANY screen. Nothing left to compare -> not a match.
+                return 0.0
             _apply_mask(np, a, mask)
             _apply_mask(np, b, mask)
         if m == MatchMethod.SSIM:

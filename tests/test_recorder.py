@@ -161,3 +161,18 @@ def test_join_recording_frames_do_not_overwrite_main_timeline_frames(tmp_path, m
     assert sp_main.ref_frame == os.path.join("frames", "sync_1.png")
     assert sp_join.ref_frame == os.path.join("frames", "join_sync_1.png")
     assert written[0] != written[1]  # distinct files -> the main timeline's frame is never clobbered
+
+
+def test_capture_sync_point_defaults_on_timeout_continue(tmp_path, monkeypatch):
+    # auto-marked syncs default to a FULL-window region that can't reliably re-match a live match, so
+    # the default on_timeout must be "continue" (not "recover") -> a flaky sync can't trigger leave/restart.
+    import tds_macro.pngio as pngio
+    monkeypatch.setattr(pngio, "frame_to_rgba_bytes", lambda f: (b"\x00\x00\x00\x00", 1, 1))
+    monkeypatch.setattr(pngio, "write_png", lambda *a, **k: None)
+    rec = Recorder(MockWindowProvider(rect=(0, 0, 1000, 1000), frontmost=True), MockInputBackend(),
+                   MockCaptureBackend(), mock_config(), HotkeyManager(mock_config(), HotkeyEvents()),
+                   clock=FakeClock())
+    rec._strat_dir = str(tmp_path)
+    rec._refresh_geo()
+    sp = rec.capture_sync_point()
+    assert sp.on_timeout == "continue"

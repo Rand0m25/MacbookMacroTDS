@@ -25,7 +25,7 @@ from typing import Callable, Optional
 from .config import Config
 from .errors import PanicAbort, WindowNotFoundError
 from .frame import Frame
-from .geometry import Coordinates, Point, WindowGeometry
+from .geometry import Coordinates, Point, WindowGeometry, clamp01
 from .recovery import FailureMode, Outcome
 from .strat import (
     ClickEvent, DragEvent, Event, KeyPressEvent, KeyReleaseEvent,
@@ -199,10 +199,12 @@ class Player:
         return f
 
     def _logical(self, p: Point) -> tuple[float, float]:
-        if self.config.click_offset_px and self.config.input_backend.value != "mock":
+        if self.config.humanize and self.config.click_offset_px and self.config.input_backend.value != "mock":
             jx = self._rng.uniform(-1, 1) * self.config.click_offset_px / max(1, self._geo.w)
             jy = self._rng.uniform(-1, 1) * self.config.click_offset_px / max(1, self._geo.h)
-            p = Point(p.x + jx, p.y + jy)
+            # clamp so a click recorded near an edge can't be jittered OUTSIDE the window content box
+            # (which norm_to_logical would then map onto adjacent UI / another app).
+            p = Point(clamp01(p.x + jx), clamp01(p.y + jy))
         return self._coords.norm_to_logical(p)
 
     # --- dispatch ---------------------------------------------------------
@@ -256,6 +258,16 @@ class Player:
         self._route_recovery(FailureMode.FOCUS_LOST)  # RESUME on refocus, else raises _StopRun
         return self.window.is_frontmost()
 
+    def _unpark(self, parked_from) -> None:
+        """Restore the cursor to where it was before a sync parked it, so a following 'click at current
+        position' (pos=None) fires where it belongs instead of in the parked corner. No-op if unparked."""
+        if parked_from is None:
+            return
+        try:
+            self.input.move(parked_from[0], parked_from[1])
+        except Exception:
+            pass
+
     # --- the adaptive visual-sync barrier --------------------------------
     def _adaptive_wait(self, sync: SyncPointEvent) -> tuple[WaitResult, Optional[Frame]]:
         cfg = self.config
@@ -281,12 +293,14 @@ class Player:
         seen_low = not require_edge
         last_live: Optional[Frame] = None
 
+        parked_from = None
         if cfg.sync_park_cursor and not str(sync.label).startswith("expect_") and not cfg.dry_run:
             try:
+                parked_from = self.input.position()  # remember so we can put it back (recheck: corner-click)
                 px, py = self._coords.norm_to_logical(_PARK)
                 self.input.move(px, py)
             except Exception:
-                pass
+                parked_from = None
 
         while True:
             self._abort_check()
@@ -311,12 +325,14 @@ class Player:
             if matched and seen_low and settled:
                 streak += 1
                 if streak >= stability:
+                    self._unpark(parked_from)  # restore the cursor before any pos=None click fires
                     return (WaitResult.FIRE, live)
             else:
                 streak = 0
 
             # M2: timeout check AFTER the match check, so a match on the final poll wins.
             if self.clock.now_ms() >= deadline:
+                self._unpark(parked_from)
                 return (WaitResult.TIMEOUT, live)
             self.clock.sleep(poll)
             self._abort_check()
@@ -460,7 +476,7 @@ class Player:
             self._abort_check()
             self._maybe_pause()
             jit = e.jitter_ms if e.jitter_ms is not None else self.config.jitter_ms  # explicit 0 suppresses (round 22c #7)
-            jitter = self._rng.uniform(-jit, jit) if jit else 0
+            jitter = self._rng.uniform(-jit, jit) if (jit and self.config.humanize) else 0  # master off -> exact timing
             target = self._iter_t0 + e.t_ms + self.clock_offset + jitter
             if prev_target is not None and target < prev_target:
                 # jitter must not pull an event before the previous one: a negative draw could

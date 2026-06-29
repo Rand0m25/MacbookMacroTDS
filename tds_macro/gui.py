@@ -677,7 +677,10 @@ def run_gui(config=None) -> int:
             loops = loop_var.get()
         except tk.TclError:  # spinbox blanked / non-numeric -> treat as infinite
             loops = 0
-        if ctrl.start_play(path_var.get(), loop_count=loops, dry_run=dry_var.get(),
+        # dry_run: only FORCE it on when the box is ticked; when unticked pass None so a strat that set
+        # dry_run in its own config_overrides is still honored (an unticked default box must never flip a
+        # dry-run strat into firing REAL input). Mirrors the CLI, where an absent --dry-run defers to the strat.
+        if ctrl.start_play(path_var.get(), loop_count=loops, dry_run=dry_var.get() or None,
                           private_server=link_var.get(), accept_ban_risk=ban_var.get()):
             log("playing…")
 

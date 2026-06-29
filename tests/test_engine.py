@@ -329,3 +329,38 @@ def test_window_not_resized_in_dry_run():
                               cfg=mock_config(loop_count=1, match_window_size_on_play=True, dry_run=True))
     p.run()
     assert win.rect == (0, 0, 1600, 900)
+
+
+# --- click-offset jitter must stay inside the window, and the humanizer master switch gates it ---
+def test_click_offset_jitter_clamped_into_window():
+    from tds_macro.config import InputBackendKind
+    st = S.StratFile(events=[], base_dir=".")
+    p, _, _, _ = build_player(st, cfg=mock_config(humanize=True, click_offset_px=10000))
+    p.config.input_backend = InputBackendKind.PYNPUT  # the offset branch is skipped for the mock backend
+    p._rng.uniform = lambda a, b: 1.0                  # force a huge positive jitter
+    px, py = p._logical(Point(0.999, 0.999))
+    assert px == 1600 and py == 900  # clamped to the window edge, not pushed outside (1600x900)
+
+
+def test_humanize_off_disables_click_offset():
+    from tds_macro.config import InputBackendKind
+    st = S.StratFile(events=[], base_dir=".")
+    p, _, _, _ = build_player(st, cfg=mock_config(humanize=False, click_offset_px=10000))
+    p.config.input_backend = InputBackendKind.PYNPUT
+    p._rng.uniform = lambda a, b: 1.0
+    px, py = p._logical(Point(0.5, 0.5))
+    assert px == 800 and py == 450  # master switch off -> exact center, no offset
+
+
+def test_parked_cursor_restored_before_pos_none_click():
+    # park on; a sync fires, then a pos=None click ("click at current spot") must land where the cursor
+    # was BEFORE parking, not in the parked top-right corner.
+    events = [S.MouseMoveEvent(1, 0, "mouse_move", pos=Point(0.3, 0.4)),
+              mk_sync(2, 10, "s1"),
+              S.ClickEvent(3, 20, "click", pos=None, button="left")]
+    st = S.StratFile(events=events, base_dir=".")
+    cap = MockCaptureBackend(current_label="s1")  # sync fires immediately
+    p, inp, _, _ = build_player(st, cfg=mock_config(sync_park_cursor=True), capture=cap)
+    p._play_sequence(st.events, RunState.IN_MATCH)
+    click_ev = [e for e in inp.events if e["action"] == "click"][-1]
+    assert click_ev["x"] == 480 and click_ev["y"] == 360  # restored to (0.3,0.4) of 1600x900

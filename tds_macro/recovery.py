@@ -21,6 +21,13 @@ log = logging.getLogger("tds_macro.recovery")
 _FOCUS_SETTLE_TRIES = 5
 
 
+def _starts_with_esc(seq) -> bool:
+    """True if a recorded sequence's first event is an Esc key-press, so recovery doesn't also press
+    Esc and toggle the just-opened Roblox menu shut."""
+    return bool(seq) and getattr(seq[0], "type", "") == "key_press" \
+        and str(getattr(seq[0], "key", "")).lower() == "esc"
+
+
 class FailureMode(str, Enum):
     NONE = "none"
     WRONG_MAP = "wrong_map"
@@ -280,17 +287,28 @@ class RecoveryController:
         """
         if self.config.dry_run:
             return False
+        seq = self.strat.leave_reset_sequence
+        # Nothing to navigate the menu with AND no way to confirm the lobby: pressing Esc alone just
+        # OPENS the Roblox menu and leaves it open, so the next replayed clicks land on menu UI / the
+        # wrong screen (and a restart replays the whole timeline into that open menu). Do nothing
+        # instead — the per-cause cap then stops the run cleanly rather than firing destructive clicks.
+        if not seq and self.strat.recovery.lobby_anchor is None:
+            log.warning("no leave_reset_sequence or lobby_anchor configured; cannot leave/reset "
+                        "reliably — not pressing a blind Esc. Record a Leave/reset sequence so recovery "
+                        "can return to the lobby.")
+            return False
         log.info("recovery: leave + reset character via Roblox menu")
-        try:
-            self.input.press_key("esc")
-            self.input.release_key("esc")
-        except Exception:
-            pass
-        if self.strat.leave_reset_sequence:
-            self._run_sequence(self.strat.leave_reset_sequence)
-        else:
-            log.warning("no leave_reset_sequence recorded; pressed Esc only (record one for a "
-                        "reliable Leave/Reset on your Roblox client version)")
+        # Press Esc to open the menu — UNLESS the recorded sequence already begins with Esc (the natural
+        # way to record "open menu"), in which case pressing it here too would TOGGLE the menu shut and
+        # the following Leave click would miss.
+        if not _starts_with_esc(seq):
+            try:
+                self.input.press_key("esc")
+                self.input.release_key("esc")
+            except Exception:
+                pass
+        if seq:
+            self._run_sequence(seq)
         if self.strat.recovery.lobby_anchor is None:
             return False  # unconfirmable; per-cause cap bounds the retries
         confirmed = self._confirm_at_lobby_within()  # poll: the hub reloads a moment after Leave
@@ -305,12 +323,15 @@ class RecoveryController:
 
         geo = self.window.get_geometry()
         coords = Coordinates(geo)
-        # Honor the recorded inter-event timing (the recorder stores gaps as each
-        # event's absolute t_ms, not as WaitEvents) so menu navigation isn't fired
-        # back-to-back too fast for Roblox to register (R-recheck #5).
+        # Honor the recorded inter-event timing (the recorder stores gaps as each event's absolute
+        # t_ms, not as WaitEvents) so menu navigation isn't fired back-to-back too fast for Roblox to
+        # register (R-recheck #5). Rebase to the FIRST event's t_ms so the user's pre-first-action
+        # reaction delay at record time isn't reproduced before every recovery's first menu action.
+        expanded = expand_all(events)
+        t_base = expanded[0].t_ms if expanded else 0
         t0 = self.clock.now_ms()
-        for e in expand_all(events):
-            self.clock.sleep_until(t0 + e.t_ms)
+        for e in expanded:
+            self.clock.sleep_until(t0 + e.t_ms - t_base)
             if isinstance(e, WaitEvent):
                 continue  # the sleep_until above already realized the delay
             elif isinstance(e, MouseMoveEvent):

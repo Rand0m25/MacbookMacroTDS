@@ -77,3 +77,12 @@ def test_identical_scores_high_all_methods(method):
     a = _rand(32, 32, 7)
     c = NumpyComparator()
     assert c.score(_frame(a), _frame(a), method) > 0.95
+
+
+def test_ssim_full_mask_returns_zero_not_false_match():
+    # a mask covering the whole region zeroes BOTH frames; SSIM/pHash of two all-zero arrays used to
+    # return 1.0 (false match on any screen). Now it returns 0.0 like the pixel-statistical metrics.
+    a = _frame(np.zeros((40, 40, 4)))
+    b = _frame(np.full((40, 40, 4), 255))
+    for method in (MatchMethod.SSIM, MatchMethod.PHASH):
+        assert NumpyComparator().score(a, b, method, mask=[Rect(0, 0, 1, 1)]) == 0.0

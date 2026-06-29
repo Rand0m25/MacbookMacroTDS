@@ -48,3 +48,18 @@ def test_sync_park_cursor_defaults_off():
 
 def test_center_cursor_on_play_defaults_on():
     assert Config().center_cursor_on_play is True
+
+
+# --- safety: an empty/blank panic hotkey is silently skipped by HotkeyManager -> reject it ---
+def test_validate_rejects_empty_panic_hotkey():
+    assert any("panic_hotkey" in p for p in Config(panic_hotkey="").validate())
+    assert any("panic_hotkey" in p for p in Config(panic_hotkey="   ").validate())
+    assert any("start_hotkey" in p for p in Config(start_hotkey="").validate())
+
+
+def test_validate_accepts_default_hotkeys():
+    assert not any("hotkey" in p for p in Config().validate())
+
+
+def test_humanize_defaults_on():
+    assert Config().humanize is True

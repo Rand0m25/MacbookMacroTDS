@@ -2,8 +2,10 @@
 
 A curated, user-editable subset of :class:`~tds_macro.config.Config` fields, edited in the GUI's
 Settings window, stored as JSON at ``~/.tds_macro_settings.json`` and applied as config overrides on
-every launch (``defaults -> these settings -> a strat's own config_overrides``). Tk-free so it can be
-unit-tested without a display; the GUI view only reads :data:`GROUPS` to lay out widgets.
+every **GUI** launch (``defaults -> these settings -> a strat's own config_overrides``). The CLI does
+NOT read this file — it builds config from defaults + the strat's config_overrides + CLI flags — so
+these are GUI preferences, not global ones. Tk-free so it can be unit-tested without a display; the GUI
+view only reads :data:`GROUPS` to lay out widgets.
 """
 
 from __future__ import annotations
@@ -25,6 +27,7 @@ GROUPS: list[tuple[str, list[tuple[str, str, str]]]] = [
         ("mark_sync_hotkey", "str", "Mark sync (while recording)"),
     ]),
     ("Humanization & timing", [
+        ("humanize", "bool", "Enable humanizer (jitter + click offset)"),
         ("jitter_ms", "int", "Timing jitter (±ms)"),
         ("click_offset_px", "int", "Click offset (±px)"),
         ("default_click_hold_ms", "int", "Click hold (ms)"),

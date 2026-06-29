@@ -280,9 +280,14 @@ class Recorder:
         data, w, h = frame_to_rgba_bytes(frame)
         write_png(abspath, data, w, h, 4)
         thr = threshold if threshold is not None else self.config.sync_default_threshold  # 0.0 is valid (round 22c #16)
+        # on_timeout="continue" (NOT "recover"): an auto-marked sync defaults to a FULL-WINDOW region,
+        # which can't reliably re-match a live, animating match — so "recover" would time out and route
+        # to leave/restart (destructive) on a strat with no recovery configured. "continue" instead keeps
+        # the recorded timeline going. Hand-edit specific syncs to "recover" once you give them a small,
+        # static region and a real leave_reset_sequence.
         sp = SyncPointEvent(0, self._now_ms(), "sync_point", label=label, ref_frame=rel,
                             region=region, threshold=thr,
-                            timeout_ms=self.config.sync_default_timeout_ms, on_timeout="recover")
+                            timeout_ms=self.config.sync_default_timeout_ms, on_timeout="continue")
         self.coalescer.add_sync_point(sp)
         return sp
 

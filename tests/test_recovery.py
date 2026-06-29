@@ -130,3 +130,49 @@ def test_stuck_sync_reclassifies_to_specific():
     out = rc.handle(FailureMode.STUCK_SYNC, scene=Frame.labelled("dc.png"))
     assert out == Outcome.REJOIN
     assert any(e.get("key") == "enter" for e in inp.events)
+
+
+def test_no_blind_esc_without_leave_sequence_or_anchor():
+    # empty leave_reset_sequence AND no lobby_anchor: recovery must NOT press a blind Esc (it would
+    # open the Roblox menu and a restart would replay the timeline into it). It does nothing instead;
+    # the per-cause cap then stops the run cleanly.
+    inp = MockInputBackend()
+    st = S.StratFile(events=[], base_dir=".")  # no leave_reset_sequence, no lobby_anchor
+    rc = RecoveryController(st, MockWindowProvider(), inp, MockCaptureBackend(), MockComparator(),
+                            FakeClock(), mock_config())
+    out = rc.handle(FailureMode.STUCK_SYNC, scene=Frame.labelled("x"))
+    assert out == Outcome.REJOIN
+    assert not any(e.get("key") == "esc" for e in inp.events)  # no blind Esc opened the menu
+
+
+def test_recorded_leave_sequence_starting_with_esc_not_double_pressed():
+    # if the recorded leave sequence already opens the menu with Esc, recovery must NOT also press Esc
+    # (that would toggle the menu shut and the Leave click would miss). Exactly one Esc press total.
+    seq = [S.KeyPressEvent(1, 0, "key_press", key="esc"),
+           S.KeyReleaseEvent(2, 30, "key_release", key="esc"),
+           S.ClickEvent(3, 200, "click", pos=Point(0.5, 0.62), comment="Leave")]
+    st = S.StratFile(events=[], leave_reset_sequence=seq, base_dir=".")
+    inp = MockInputBackend()
+    rc = RecoveryController(st, MockWindowProvider(), inp, MockCaptureBackend(), MockComparator(),
+                            FakeClock(), mock_config())
+    rc.handle(FailureMode.WRONG_MAP)
+    esc_presses = [e for e in inp.events if e.get("action") == "key_press" and e.get("key") == "esc"]
+    assert len(esc_presses) == 1  # only the recorded Esc; recovery didn't add a second
+
+
+def test_leave_sequence_timing_rebased_to_first_event():
+    # the leave sequence's first event carries the user's record-time reaction delay as its absolute
+    # t_ms; recovery must rebase so it doesn't wait that whole delay before the first menu action.
+    seq = [S.KeyPressEvent(1, 5000, "key_press", key="esc"),
+           S.ClickEvent(2, 5200, "click", pos=Point(0.5, 0.6), comment="Leave")]
+    st = S.StratFile(events=[], leave_reset_sequence=seq,
+                     recovery=S.RecoverySpec(lobby_anchor=S.DetectorSpec("lobby.png", Rect(0, 0, 1, 1), 0.9)),
+                     base_dir=".")
+    clk = FakeClock()
+    cap = MockCaptureBackend(current_label="lobby.png")
+    rc = RecoveryController(st, MockWindowProvider(), MockInputBackend(), cap, MockComparator(), clk,
+                            mock_config())
+    t_start = clk.now_ms()
+    rc.handle(FailureMode.WRONG_MAP)
+    # pre-fix the clock would jump >=5000ms (first event's t_ms) before acting; rebased it spans ~200ms
+    assert clk.now_ms() - t_start < 1000
