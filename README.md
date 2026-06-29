@@ -60,6 +60,7 @@ A small window opens with everything in one place:
 | **Record** | start capturing your play; press **Stop** (or `F8`) to finish + save |
 | **Play** | replay the strat with visual-sync timing, recovery, and auto-loop |
 | **Pause/Resume** · **Stop / Panic** | pause excludes input from a recording; Stop releases all held keys immediately |
+| **Settings…** | a separate window to edit hotkeys, humanization/timing, sync-localization, and recovery/sync/safety knobs. Saved to `~/.tds_macro_settings.json` and applied on every launch (Reset-to-defaults included); edit while idle. A strat's own `config_overrides` still win over these. |
 
 The status line shows live `runs / wins / losses / recoveries`.
 

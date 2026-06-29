@@ -125,6 +125,30 @@ def _default_set_consent():
         pass
 
 
+def _default_load_settings():
+    from . import settings
+
+    return settings.load()
+
+
+def _default_save_settings(values):
+    from . import settings
+
+    settings.save(values)
+
+
+def _default_validate_settings(values):
+    from . import settings
+
+    return settings.validate(values)
+
+
+def _default_settings_defaults():
+    from . import settings
+
+    return settings.defaults()
+
+
 @dataclass
 class GuiDeps:
     build_config: Callable = _default_build_config
@@ -136,6 +160,11 @@ class GuiDeps:
     consent_ok: Callable = _default_consent_ok
     set_consent: Callable = _default_set_consent
     make_header: Optional[Callable] = None  # (name, map, difficulty) -> Header
+    # persisted GUI settings (a curated subset of Config applied as overrides) — see tds_macro/settings.py
+    load_settings: Callable = _default_load_settings
+    save_settings: Callable = _default_save_settings
+    validate_settings: Callable = _default_validate_settings
+    settings_defaults: Callable = _default_settings_defaults
 
 
 # --------------------------------------------------------------------------- #
@@ -152,6 +181,57 @@ class GuiController:
         self._hk = None
         self._player = None
         self._activity = "idle"  # idle | record | play
+        # effective (full) settings = defaults with the user's saved overrides layered on top; a corrupt
+        # or absent file degrades to defaults (settings.load returns {}).
+        try:
+            self.settings = {**self.deps.settings_defaults(), **(self.deps.load_settings() or {})}
+        except Exception:
+            self.settings = dict(self.deps.settings_defaults())
+
+    # -- settings (a curated subset of Config, persisted, applied as config overrides) --
+    def effective_settings(self) -> dict:
+        """The current value of every editable setting (for the Settings window to populate)."""
+        with self._lock:
+            return dict(self.settings)
+
+    def _merged_overrides(self, strat_overrides=None) -> dict:
+        """Config overrides for a run: user settings as the base, the strat's own config_overrides on
+        top (a strat stays the most-specific source, matching prior precedence)."""
+        with self._lock:
+            base = dict(self.settings)
+        base.update(strat_overrides or {})
+        return base
+
+    def save_settings(self, values: dict):
+        """Validate, persist (best-effort), and apply new settings. Idle-only. Returns (ok, problems)."""
+        if self.is_busy():
+            return False, ["stop the current activity before changing settings"]
+        problems = self.deps.validate_settings(values)
+        if problems:
+            return False, list(problems)
+        merged = {**self.effective_settings(), **values}
+        try:
+            self.deps.save_settings(merged)  # persist; honored in-memory below even if the write fails
+        except Exception as e:
+            self._emit("error", f"settings applied but could not be saved: {e}")
+        with self._lock:
+            self.settings = merged
+        self._emit("log", "settings saved")
+        return True, []
+
+    def reset_settings(self):
+        """Restore (and persist) the default settings. Idle-only. Returns (ok, problems)."""
+        if self.is_busy():
+            return False, ["stop the current activity before changing settings"]
+        defaults = dict(self.deps.settings_defaults())
+        try:
+            self.deps.save_settings(defaults)
+        except Exception as e:
+            self._emit("error", f"settings reset but could not be saved: {e}")
+        with self._lock:
+            self.settings = defaults
+        self._emit("log", "settings reset to defaults")
+        return True, []
 
     # -- helpers --
     def _emit(self, kind: str, payload=None) -> None:
@@ -203,7 +283,7 @@ class GuiController:
         # link — so Validate and Play agree (a bad link no longer gets a false green light) (round
         # 22c #18 + round 23 #10).
         try:
-            cfg = self.deps.build_config(overrides=getattr(st, "config_overrides", None),
+            cfg = self.deps.build_config(overrides=self._merged_overrides(getattr(st, "config_overrides", None)),
                                          private_server=private_server)
         except Exception as e:
             return False, [f"bad config_overrides: {e}"]
@@ -263,7 +343,7 @@ class GuiController:
                 self._emit("error", f"load failed: {e}")
                 return False
             try:
-                cfg = self.deps.build_config(overrides=getattr(st, "config_overrides", None),
+                cfg = self.deps.build_config(overrides=self._merged_overrides(getattr(st, "config_overrides", None)),
                                              loop_count=loop_count, dry_run=dry_run,
                                              private_server=private_server)
             except Exception as e:
@@ -346,7 +426,7 @@ class GuiController:
                 self._emit("error", "already running")
                 return False
             try:
-                cfg = self.deps.build_config(private_server=private_server)
+                cfg = self.deps.build_config(overrides=self._merged_overrides(), private_server=private_server)
             except Exception as e:
                 self._emit("error", f"could not start: {e}")
                 return False
@@ -593,10 +673,83 @@ def run_gui(config=None) -> int:
                           private_server=link_var.get(), accept_ban_risk=ban_var.get()):
             log("playing…")
 
+    def open_settings():
+        from . import settings as _settings
+        if ctrl.is_busy():  # settings are edit-while-idle only
+            log("settings: stop the current activity first")
+            return
+        win = tk.Toplevel(root)
+        win.title("Settings")
+        win.transient(root)
+        cur = ctrl.effective_settings()
+        vars_by_field = {}
+
+        def _repopulate(values):
+            for fld, (var, knd) in vars_by_field.items():
+                if knd == "bool":
+                    var.set(bool(values.get(fld, False)))
+                else:
+                    var.set("" if values.get(fld) is None else str(values.get(fld)))
+
+        body = ttk.Frame(win)
+        body.pack(fill="both", expand=True, padx=8, pady=6)
+        left, right = ttk.Frame(body), ttk.Frame(body)
+        left.grid(row=0, column=0, sticky="nw", padx=6)
+        right.grid(row=0, column=1, sticky="nw", padx=6)
+        for gtitle, items in _settings.GROUPS:
+            # the big Recovery/safety group gets its own column; the rest stack on the left
+            lf = ttk.LabelFrame(right if gtitle.startswith("Recovery") else left, text=gtitle)
+            lf.pack(fill="x", pady=4, anchor="n")
+            for ri, (field, kind, label) in enumerate(items):
+                ttk.Label(lf, text=label).grid(row=ri, column=0, sticky="w", padx=4, pady=2)
+                if kind == "bool":
+                    var = tk.BooleanVar(value=bool(cur.get(field, False)))
+                    ttk.Checkbutton(lf, variable=var).grid(row=ri, column=1, sticky="w", padx=4)
+                else:
+                    val = cur.get(field)
+                    var = tk.StringVar(value="" if val is None else str(val))
+                    ttk.Entry(lf, textvariable=var, width=12).grid(row=ri, column=1, sticky="w", padx=4)
+                vars_by_field[field] = (var, kind)
+
+        msg = tk.Label(win, text="", fg="red", wraplength=520, justify="left")
+        msg.pack(fill="x", padx=10)
+
+        def _collect():
+            out = {}
+            for field, (var, kind) in vars_by_field.items():
+                v = var.get()
+                if kind in ("int", "float") and isinstance(v, str) and not v.strip():
+                    continue  # a blank numeric field -> keep the current value, don't send ""
+                out[field] = v
+            return out
+
+        def do_save():
+            ok, problems = ctrl.save_settings(_collect())
+            if ok:
+                win.destroy()
+            else:
+                msg.config(text="  ·  ".join(problems))
+
+        def do_reset():
+            ok, problems = ctrl.reset_settings()
+            if ok:
+                _repopulate(ctrl.effective_settings())
+                msg.config(text="reset to defaults (Save not needed — already applied)", fg="green")
+            else:
+                msg.config(text="  ·  ".join(problems), fg="red")
+
+        btns = ttk.Frame(win)
+        btns.pack(fill="x", padx=10, pady=8)
+        ttk.Button(btns, text="Save", command=do_save).pack(side="left")
+        ttk.Button(btns, text="Reset to defaults", command=do_reset).pack(side="left", padx=6)
+        ttk.Button(btns, text="Cancel", command=win.destroy).pack(side="right")
+        win.update_idletasks()
+
     ttk.Button(frm, text="Record", command=do_record).grid(row=4, column=0, **pad)
     ttk.Button(frm, text="Play", command=do_play).grid(row=4, column=1, **pad)
     ttk.Button(frm, text="Pause/Resume", command=ctrl.pause_toggle).grid(row=4, column=2, **pad)
     ttk.Button(frm, text="Stop / Panic", command=ctrl.stop).grid(row=4, column=3, **pad)
+    ttk.Button(frm, text="Settings…", command=open_settings).grid(row=4, column=4, **pad)
 
     status_var = tk.StringVar(value="idle")
     ttk.Label(frm, textvariable=status_var).grid(row=5, column=0, columnspan=6, sticky="w", **pad)

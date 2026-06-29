@@ -87,7 +87,11 @@ def _setup(*, consent=True, load=None, **over):
         save_strat=lambda strat, path: h["saved"].append((strat, path)),
         consent_ok=lambda: h["consent"], set_consent=lambda: h.__setitem__("consent", True),
         make_header=lambda n, m, d: S.Header(name=n, map=m, difficulty=d),
+        # hermetic settings deps so tests never touch the real ~/.tds_macro_settings.json
+        load_settings=lambda: {}, save_settings=lambda v: h["saved_settings"].append(v),
+        validate_settings=lambda v: [], settings_defaults=lambda: {},
     )
+    h["saved_settings"] = []
     for k, v in over.items():
         setattr(deps, k, v)
     events = []
@@ -393,6 +397,70 @@ def test_start_record_rejects_unknown_target():
     ctrl, h, events = _setup()
     assert ctrl.start_record("m.strat.json", target="bogus") is False
     assert not ctrl.is_busy() and any(k == "error" for k, _ in events)
+
+
+# -- Settings (persisted Config-override subset) --
+def test_settings_load_into_effective():
+    ctrl, _, _ = _setup(load_settings=lambda: {"jitter_ms": 99},
+                        settings_defaults=lambda: {"jitter_ms": 0, "verify_foreground": True})
+    eff = ctrl.effective_settings()
+    assert eff["jitter_ms"] == 99 and eff["verify_foreground"] is True  # defaults + saved overrides
+
+
+def test_settings_applied_as_overrides_and_strat_wins():
+    ctrl, h, _ = _setup(load_settings=lambda: {"jitter_ms": 99, "sync_poll_ms": 5},
+                        settings_defaults=lambda: {"jitter_ms": 0, "sync_poll_ms": 1},
+                        load=lambda p: S.StratFile(base_dir=".", config_overrides={"sync_poll_ms": 7}))
+    ctrl.start_play("x.json")
+    try:
+        ov = h["cfg_kwargs"]["overrides"]
+        assert ov["jitter_ms"] == 99   # user setting reaches the config build
+        assert ov["sync_poll_ms"] == 7  # a strat's config_overrides win over the setting
+    finally:
+        ctrl.stop()
+
+
+def test_save_settings_validates_persists_and_applies():
+    ctrl, h, _ = _setup(settings_defaults=lambda: {"jitter_ms": 0})
+    ok, problems = ctrl.save_settings({"jitter_ms": 50})
+    assert ok and not problems
+    assert ctrl.effective_settings()["jitter_ms"] == 50
+    assert h["saved_settings"][-1]["jitter_ms"] == 50
+
+
+def test_save_settings_rejects_invalid_without_persisting():
+    ctrl, h, _ = _setup(settings_defaults=lambda: {"jitter_ms": 0},
+                        validate_settings=lambda v: ["jitter_ms: bad"])
+    ok, problems = ctrl.save_settings({"jitter_ms": "x"})
+    assert ok is False and "jitter_ms: bad" in problems
+    assert not h["saved_settings"]  # nothing persisted
+    assert ctrl.effective_settings()["jitter_ms"] == 0  # unchanged
+
+
+def test_save_settings_blocked_while_busy():
+    ctrl, h, _ = _setup(settings_defaults=lambda: {"jitter_ms": 0})
+    assert ctrl.start_play("x.json") is True
+    assert h["player"].started.wait(1.0)
+    try:
+        ok, problems = ctrl.save_settings({"jitter_ms": 50})
+        assert ok is False and problems
+    finally:
+        ctrl.stop()
+
+
+def test_reset_settings_restores_defaults():
+    ctrl, h, _ = _setup(load_settings=lambda: {"jitter_ms": 99}, settings_defaults=lambda: {"jitter_ms": 0})
+    assert ctrl.effective_settings()["jitter_ms"] == 99
+    ok, _ = ctrl.reset_settings()
+    assert ok and ctrl.effective_settings()["jitter_ms"] == 0
+    assert h["saved_settings"][-1]["jitter_ms"] == 0
+
+
+def test_corrupt_settings_file_degrades_to_defaults():
+    def boom():
+        raise ValueError("corrupt")
+    ctrl, _, _ = _setup(load_settings=boom, settings_defaults=lambda: {"jitter_ms": 7})
+    assert ctrl.effective_settings()["jitter_ms"] == 7  # fell back to defaults, didn't crash
 
 
 # -- Pause / Stop --
