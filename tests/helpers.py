@@ -19,7 +19,8 @@ def mock_config(**kw) -> Config:
     c = Config(
         input_backend=InputBackendKind.MOCK, screen_backend=ScreenBackendKind.MOCK,
         window_backend=WindowBackendKind.MOCK, window_rect_override=(0, 0, 1600, 900),
-        sync_park_cursor=False, recovery_check_every_ms=10 ** 9,  # guards off unless asked
+        sync_park_cursor=False, center_cursor_on_play=False,  # cursor-moving conveniences off unless asked
+        recovery_check_every_ms=10 ** 9,  # guards off unless asked
     )
     for k, v in kw.items():
         setattr(c, k, v)

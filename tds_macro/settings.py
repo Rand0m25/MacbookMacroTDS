@@ -43,6 +43,7 @@ GROUPS: list[tuple[str, list[tuple[str, str, str]]]] = [
         ("failsafe_corner", "bool", "Failsafe-corner abort"),
         ("block_on_aspect_mismatch", "bool", "Block on aspect mismatch"),
         ("sync_park_cursor", "bool", "Park cursor during sync"),
+        ("center_cursor_on_play", "bool", "Center cursor before play"),
         ("sync_default_threshold", "float", "Sync match threshold (0–1)"),
         ("sync_default_timeout_ms", "int", "Sync timeout (ms)"),
         ("sync_poll_ms", "int", "Sync poll (ms)"),

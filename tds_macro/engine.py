@@ -626,6 +626,20 @@ class Player:
                 raise _StopRun(msg)
             log.warning(msg)
 
+    def _center_cursor_in_window(self) -> None:
+        """Move the cursor into the MIDDLE of the Roblox window before playback begins, so the first
+        recorded action starts from inside the game. A cursor left in another app or on a second monitor
+        can otherwise make an opening hover / relative move land outside Roblox. Best-effort and gated:
+        no-op in dry-run, when disabled, or before geometry is known (any failure is swallowed — it must
+        never block a run)."""
+        if self.config.dry_run or not self.config.center_cursor_on_play or self._coords is None:
+            return
+        try:
+            px, py = self._coords.norm_to_logical(Point(0.5, 0.5))
+            self.input.move(px, py)
+        except Exception:  # noqa: BLE001 - centering is a convenience, never fatal
+            log.debug("center-cursor-on-play skipped", exc_info=True)
+
     def _verify_expected_map(self) -> None:
         det = self.strat.expected_map_check
         if det is None:
@@ -727,6 +741,7 @@ class Player:
         try:
             self._ensure_window_or_launch()  # cold start: launch Roblox via the private-server link if needed
             self._arm()
+            self._center_cursor_in_window()  # start with the cursor inside the Roblox window (before any play)
             loop_count = self.config.loop_count
             session_start = self.clock.now_ms()  # for the session_max_minutes cap (round 22 #H)
             consecutive_restarts = 0

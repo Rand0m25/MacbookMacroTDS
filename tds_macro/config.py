@@ -82,7 +82,10 @@ class Config:
     sync_stability_frames: int = 2
     sync_timeout_slack_ms: int = 500  # added to (stability+1)*poll min-timeout (M2)
     sync_max_retries: int = 2  # bounded re-polls of the barrier when on_timeout="retry"
-    sync_park_cursor: bool = True  # park cursor out of ROI before polling (S3)
+    sync_park_cursor: bool = False  # default OFF: leave the cursor where the last action put it during a
+    #                                 sync poll. ON parks it in the top-right corner so it can't sit over
+    #                                 the ROI, but that visibly yanks the cursor away mid-run; opt in only
+    #                                 when a sync region overlaps where the cursor naturally rests (S3).
 
     # --- recovery ---
     recovery_threshold: float = 0.88
@@ -147,6 +150,10 @@ class Config:
     verify_foreground: bool = True  # validate Roblox is frontmost right before every input primitive,
     #                                 so a click/keypress can never land in another app (else focus is
     #                                 only checked every recovery_check_every_ms and input fires blind)
+    center_cursor_on_play: bool = True  # before playback starts, move the cursor to the middle of the
+    #                                     Roblox window so the first recorded action begins from inside the
+    #                                     game (a cursor left in another app/monitor can make an opening
+    #                                     hover/relative move land outside Roblox). No-op in dry-run.
     dry_run: bool = False
     log_level: str = "INFO"
 

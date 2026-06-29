@@ -38,3 +38,13 @@ def test_strat_overrides_cannot_quietly_switch_to_mock_window():
     # a strat's config_overrides flipping window_backend to "mock" on a real run is now caught
     c = Config().with_overrides({"window_backend": "mock"})
     assert any("incoherent backends" in p for p in c.validate())
+
+
+# --- cursor-behaviour defaults: don't yank the cursor away during a sync; do start inside the window ---
+def test_sync_park_cursor_defaults_off():
+    # parking visibly jerks the cursor to the corner mid-run; it's now opt-in (was True).
+    assert Config().sync_park_cursor is False
+
+
+def test_center_cursor_on_play_defaults_on():
+    assert Config().center_cursor_on_play is True

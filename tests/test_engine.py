@@ -246,3 +246,47 @@ def test_sync_timeout_recover_restart_loop():
     stats = p.run()
     assert stats.sync_timeouts >= 1 and rec.handle_calls
     assert stats.restarts == 4 and stats.runs == 0  # restart != completed run (R6)
+
+
+# --- cursor stays put during a sync poll by default (no top-right "park" jerk) ---
+def test_no_cursor_park_during_sync_by_default():
+    # mock_config defaults sync_park_cursor=False; a firing sync must not emit any cursor move.
+    st = S.StratFile(events=[mk_sync(1, 0, "s1")], base_dir=".")
+    cap = MockCaptureBackend(current_label="s1")  # matches the sync ref label immediately
+    p, inp, _, _ = build_player(st, cfg=mock_config(), capture=cap)
+    p._play_sequence(st.events, RunState.IN_MATCH)
+    assert not any(e["action"] == "move" for e in inp.events)
+
+
+def test_sync_park_cursor_moves_to_corner_when_enabled():
+    # opt back in -> the cursor is parked in the top-right corner before polling (old default behaviour).
+    st = S.StratFile(events=[mk_sync(1, 0, "s1")], base_dir=".")
+    cap = MockCaptureBackend(current_label="s1")
+    p, inp, _, _ = build_player(st, cfg=mock_config(sync_park_cursor=True), capture=cap)
+    p._play_sequence(st.events, RunState.IN_MATCH)
+    moves = [e for e in inp.events if e["action"] == "move"]
+    assert moves and moves[0]["x"] > 1200 and moves[0]["y"] < 100  # top-right of the 1600x900 window
+
+
+# --- the cursor is moved into the window before playback begins ---
+def test_center_cursor_moves_into_window_before_play():
+    st = S.StratFile(events=_keys((0, "a")), base_dir=".")
+    p, inp, _, _ = build_player(st, cfg=mock_config(loop_count=1, center_cursor_on_play=True))
+    p.run()
+    moves = [e for e in inp.events if e["action"] == "move"]
+    assert moves, "expected a centering move before play"
+    assert moves[0]["x"] == 800 and moves[0]["y"] == 450  # middle of the 1600x900 window
+
+
+def test_center_cursor_noop_when_disabled():
+    st = S.StratFile(events=_keys((0, "a")), base_dir=".")
+    p, inp, _, _ = build_player(st, cfg=mock_config(loop_count=1, center_cursor_on_play=False))
+    p.run()
+    assert not any(e["action"] == "move" for e in inp.events)
+
+
+def test_center_cursor_noop_in_dry_run():
+    st = S.StratFile(events=_keys((0, "a")), base_dir=".")
+    p, inp, _, _ = build_player(st, cfg=mock_config(loop_count=1, center_cursor_on_play=True, dry_run=True))
+    p.run()
+    assert inp.events == []

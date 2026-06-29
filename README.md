@@ -190,6 +190,13 @@ move), the macro verifies the **Roblox window is frontmost**, so an action can n
 another app if you alt-tab away. If focus is lost it refocuses Roblox first (bounded, then
 stops); it never fires blind. Opt out with `config_overrides: {"verify_foreground": false}`.
 
+**Cursor placement.** Before playback starts, the macro moves the cursor into the **middle of the
+Roblox window** so the first action begins from inside the game (toggle: `center_cursor_on_play`,
+default on). And during a visual-sync wait the cursor is now **left where it is** instead of being
+parked in a corner — so checking a sync no longer yanks the pointer to the top-right of the screen
+(toggle: `sync_park_cursor`, default off; turn it on only if a sync region sits under where the
+cursor naturally rests). Both are also editable in **Settings…**.
+
 ### Tips for reliable strats
 - Record and replay at the **same window size** and Roblox **GUI scale** — UI buttons
   reflow with size (world-space tower placements are size-independent; button taps aren't).
